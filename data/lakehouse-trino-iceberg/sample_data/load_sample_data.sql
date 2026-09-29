@@ -1,4 +1,4 @@
--- Loads a small sales dataset into an Iceberg table on MinIO through Trino.
+-- Loads a small sales dataset into an Iceberg table on an S3-compatible store (RustFS) through Trino.
 -- Safe to run any number of times: the table is emptied before the insert, so a
 -- second run leaves 10 rows, not 20. (traps/load_naive.sql is the version without
 -- that DELETE, and the smoke test shows what it does.)

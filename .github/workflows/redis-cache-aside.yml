@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: redis-cache-aside-${{ github.ref }}
+  group: redis-cache-aside-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -26,8 +26,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
       - name: Copy the module out of the repository
         run: cp -r data/redis-cache-aside "$RUNNER_TEMP/module"
       - name: make test (in the copy, so nothing depends on the repo root)

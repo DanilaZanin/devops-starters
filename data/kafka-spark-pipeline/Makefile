@@ -23,7 +23,7 @@ up: check-prereqs .env ## Build and start the whole pipeline
 lint: .env ## Static checks that need no running containers
 	python3 tests/check_compose.py
 
-test: check-prereqs lint ## Config checks, then an end-to-end smoke run (takes a few minutes)
+test: check-prereqs lint ## Config checks, then an end-to-end smoke run from clean volumes (deletes this module's data)
 	bash tests/smoke.sh
 
 logs: ## Follow producer and Spark logs

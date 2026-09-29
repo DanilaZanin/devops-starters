@@ -41,6 +41,8 @@ def on_delivery(err, msg):
         print(f"delivery failed: {err}", file=sys.stderr, flush=True)
     else:
         delivered += 1
+        if delivered == 1:
+            print("first delivery confirmed", flush=True)
         if delivered % 50 == 0:
             print(f"delivered {delivered} events", flush=True)
 

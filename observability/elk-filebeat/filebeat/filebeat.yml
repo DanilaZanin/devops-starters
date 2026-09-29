@@ -4,6 +4,8 @@
 filebeat.autodiscover:
   providers:
     - type: docker
+      # docker-proxy allows read-only calls only; there is no Docker socket in this container.
+      host: "tcp://docker-proxy:2375"
       hints.enabled: true
       hints.default_config:
         # This line is what makes collection opt-in. Without it, default_config is
@@ -20,7 +22,8 @@ filebeat.autodiscover:
           - /var/lib/docker/containers/${data.container.id}/*.log
 
 processors:
-  - add_docker_metadata: ~
+  - add_docker_metadata:
+      host: "tcp://docker-proxy:2375"
 
 # The index template and the ILM policy are created by the `setup` service, so
 # Filebeat only needs permission to write documents.

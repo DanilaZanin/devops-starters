@@ -17,9 +17,8 @@ check-prereqs: ## Verify docker and docker compose are usable
 .env:
 	cp .env.example .env
 
-up: check-prereqs .env ## Start the S3 server, the Iceberg REST catalog and Trino, wait until Trino answers
-	$(COMPOSE) up -d --build
-	@for i in $$(seq 1 60); do $(COMPOSE) exec -T trino trino --execute 'SELECT 1' >/dev/null 2>&1 && exit 0; sleep 5; done; echo "Trino did not become ready within 5 minutes"; exit 1
+up: check-prereqs .env ## Start the S3 server, the Iceberg REST catalog and Trino, wait until all are healthy
+	$(COMPOSE) up -d --build --wait --wait-timeout 300
 
 lint: .env ## Static checks that need no running containers
 	python3 tests/check_compose.py

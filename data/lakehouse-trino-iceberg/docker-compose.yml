@@ -50,15 +50,21 @@ services:
       AWS_REGION: us-east-1
     ports:
       - "127.0.0.1:8181:8181"
+    healthcheck:
+      # Lists namespaces: a real catalog operation, not just "the port is open".
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8181/v1/namespaces > /dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 5s
 
   trino:
     build:
       context: .
       dockerfile: trino/Dockerfile
-    # Trino reads the REST catalog lazily, so it does not need to wait for it.
     depends_on:
       iceberg-rest:
-        condition: service_started
+        condition: service_healthy
     environment:
       # Referenced from iceberg.properties as ${ENV:...}, so no credential is
       # written into a file that gets committed.
@@ -67,8 +73,10 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     healthcheck:
-      # Fails with "still initializing" until the server accepts queries.
-      test: ["CMD-SHELL", "trino --execute 'SELECT 1' > /dev/null 2>&1"]
+      # `SELECT 1` only proves the server is up: Trino reads the REST catalog lazily.
+      # Listing the schemas of the iceberg catalog goes through the catalog to the
+      # object store setup, so "healthy" means "can create and read tables".
+      test: ["CMD-SHELL", "trino --execute 'SHOW SCHEMAS FROM iceberg' > /dev/null 2>&1"]
       interval: 10s
       timeout: 15s
       retries: 30

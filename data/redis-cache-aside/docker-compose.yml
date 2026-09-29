@@ -31,6 +31,8 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
       CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-30}
       SOURCE_LATENCY_S: ${SOURCE_LATENCY_S:-0.5}
+      LOCK_TTL_MS: ${LOCK_TTL_MS:-5000}
+      LOCK_WAIT_S: ${LOCK_WAIT_S:-6}
     ports:
       - "127.0.0.1:8000:8000"
     healthcheck:

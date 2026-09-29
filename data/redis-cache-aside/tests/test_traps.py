@@ -38,12 +38,28 @@ def stampede(cache_cls, settings, source):
 
 # ------------------------------------------------ trap 1: cache stampede
 
+class GatedSource(ProductSource):
+    """Holds every fetch until `expected` of them are waiting, so no request can find a
+    filled cache before all of them have missed. Removes the timing luck from the test."""
+
+    def __init__(self, expected: int) -> None:
+        super().__init__(latency_s=0)
+        self.expected, self.entered, self.gate = expected, 0, asyncio.Event()
+
+    async def fetch(self, product_id: int) -> dict:
+        self.entered += 1
+        if self.entered >= self.expected:
+            self.gate.set()
+        await asyncio.wait_for(self.gate.wait(), timeout=10)
+        return await super().fetch(product_id)
+
+
 def test_broken_cache_stampedes_on_cold_key(settings, sync_redis):
-    source = ProductSource(latency_s=0.3)
+    source = GatedSource(CONCURRENT_REQUESTS)
     responses = stampede(BrokenCacheAside, settings, source)
 
     assert all(r.status_code == 200 for r in responses)
-    assert source.calls >= 40, f"expected a stampede, the source was called {source.calls} times"
+    assert source.calls == CONCURRENT_REQUESTS, f"expected a stampede, the source was called {source.calls} times"
 
 
 def test_fixed_cache_loads_a_cold_key_once(settings, sync_redis):
@@ -51,7 +67,7 @@ def test_fixed_cache_loads_a_cold_key_once(settings, sync_redis):
     responses = stampede(CacheAside, settings, source)
 
     assert all(r.status_code == 200 for r in responses)
-    assert source.calls <= 2, f"the source was called {source.calls} times for one key"
+    assert source.calls == 1, f"the source was called {source.calls} times for one key"
     assert len({r.text for r in responses}) == 1, "every caller must see the same value"
     statuses = [r.headers["X-Cache"] for r in responses]
     assert statuses.count("miss") == 1
@@ -118,6 +134,77 @@ def test_fixed_cache_still_answers_when_redis_accepts_but_never_replies(settings
     assert elapsed < 2.0, f"socket timeouts should bound the wait, took {elapsed:.2f}s"
 
 
+# ------------- lock lifecycle: lease expiry, slow loaders, late writers
+
+def lock_key_of(settings, product_id=1):
+    return make_key(settings.key_prefix, "product", id=product_id) + ":lock"
+
+
+def test_dead_lock_holder_costs_one_source_call(settings, sync_redis):
+    """The process that held the lock died. The lease expires, exactly one waiter takes over."""
+    settings = dataclasses.replace(settings, lock_ttl_ms=1000)
+    sync_redis.set(lock_key_of(settings), "dead-owner", px=settings.lock_ttl_ms)
+    source = ProductSource(latency_s=0.05)
+    responses = stampede(CacheAside, settings, source)
+
+    assert all(r.status_code == 200 for r in responses)
+    assert source.calls == 1, f"{source.calls} source calls after the lock holder died"
+
+
+def test_giving_up_on_the_lock_still_loads_once_per_process(settings, sync_redis):
+    """Wait budget shorter than the lease (a misconfiguration): waiters give up while the
+    lock is still held. They must share one fallback load, not send 50 to the source."""
+    settings = dataclasses.replace(settings, lock_ttl_ms=3000, lock_wait_s=0.3)
+    sync_redis.set(lock_key_of(settings), "slow-or-dead-owner", px=settings.lock_ttl_ms)
+    source = ProductSource(latency_s=0.05)
+    responses = stampede(CacheAside, settings, source)
+
+    assert all(r.status_code == 200 for r in responses)
+    assert source.calls == 1, f"{source.calls} parallel fallback loads"
+    assert {r.headers["X-Cache"] for r in responses} == {"bypass"}
+
+
+def test_source_slower_than_the_old_wait_budget_is_still_loaded_once(settings, sync_redis):
+    """2.5 s loads used to outlast the 2 s wait: all 50 waiters gave up and hit the source."""
+    source = ProductSource(latency_s=2.5)
+    responses = stampede(CacheAside, settings, source)
+
+    assert all(r.status_code == 200 for r in responses)
+    assert source.calls == 1, f"{source.calls} source calls for a 2.5 s load"
+
+
+def test_loader_that_outlives_its_lease_cannot_overwrite_the_new_owners_value(settings, sync_redis):
+    """A is slow and loses its lease; B takes over and caches the fresh value; A must not
+    write its stale result over it when it finally finishes."""
+    settings = dataclasses.replace(settings, lock_ttl_ms=300)
+
+    class SlowThenFast(ProductSource):
+        async def fetch(self, product_id):
+            self.calls += 1
+            if self.calls == 1:
+                await asyncio.sleep(1.0)
+                return {"version": "stale"}
+            return {"version": "fresh"}
+
+    source = SlowThenFast()
+    app = create_app(settings, CacheAside, source)
+
+    async def requests(client):
+        slow = asyncio.create_task(client.get("/products/1"))
+        await asyncio.sleep(0.6)  # A's lease (300 ms) has expired, A is still loading
+        fresh = await client.get("/products/1")
+        stale = await slow
+        after = await client.get("/products/1")
+        return fresh, stale, after
+
+    fresh, stale, after = asyncio.run(call(app, requests))
+
+    assert fresh.json() == {"version": "fresh"}
+    assert stale.json() == {"version": "stale"}  # A still answers its own caller
+    assert after.json() == {"version": "fresh"}, "the late writer clobbered the newer value"
+    assert sync_redis.exists(lock_key_of(settings)) == 0
+
+
 # -------------------------------------------------- normal cache behavior
 
 def test_second_request_is_a_hit_and_invalidate_forces_a_reload(settings, sync_redis):
@@ -168,3 +255,9 @@ def test_keys_are_stable_and_depend_on_the_arguments():
     assert key == "shop:product:037c9214eef74cc3"  # fixed digest: must not change between processes
     assert make_key("shop:", "list", page=1, size=10) == make_key("shop:", "list", size=10, page=1)
     assert make_key("shop:", "product", id=1) != make_key("shop:", "product", id=2)
+
+
+def test_default_wait_budget_outlasts_the_lock_lease():
+    from app.config import Settings
+
+    assert Settings().lock_wait_s > Settings().lock_ttl_ms / 1000

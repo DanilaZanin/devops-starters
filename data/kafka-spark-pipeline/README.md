@@ -21,13 +21,13 @@ make test    # static checks, then an end-to-end smoke run (a few minutes)
 make reset   # removes containers and all data
 ```
 
-Expected: about a minute after `make up`, `make logs` shows lines like `batch 0: upserted 18 aggregated rows into postgres`, and the query above returns one row per product and window with `orders_count` and `revenue` growing while the window is open. `make test` ends with `SMOKE PASSED`.
+Expected: about a minute after `make up`, `make logs` shows lines like `batch 0: upserted 18 aggregated rows into postgres`, and the query above returns one row per product and window with `orders_count` and `revenue` growing while the window is open. `make test` ends with `SMOKE PASSED`. It starts by deleting this module's containers and volumes (`docker compose down -v`), so run it on a stack whose data you do not need.
 
 Requirements: docker with compose v2, python3, make. Budget several GB of RAM for Docker: Kafka and Spark both run a JVM. `make check-prereqs` verifies the tools.
 
 | Verified on | RAM | First run (cold image cache) |
 |---|---|---|
-| 2026-09-29, macOS arm64, colima 4 CPU / 8 GB, `make test`: SMOKE PASSED (not yet run on an ubuntu-24.04 runner) | about 1.5 GiB in total, Spark about 1.1 GiB, Kafka about 0.3 GiB (`docker stats`) | about 60 s for build, start and first rows with the base images already pulled; the pull of the Spark, Kafka and Postgres images is extra |
+| 2026-09-29, macOS arm64, colima 4 CPU / 8 GB, `make test`: SMOKE PASSED, twice in a row (not yet run on an ubuntu-24.04 runner) | about 1.5 GiB in total, Spark about 1.1 GiB, Kafka about 0.3 GiB (`docker stats`) | about 60 s for `make test` (clean volumes, build, start, first rows, malformed-event check) with the base images already pulled; the pull of the Spark, Kafka and Postgres images is extra |
 
 ## Traps this avoids
 
@@ -35,9 +35,10 @@ Requirements: docker with compose v2, python3, make. Budget several GB of RAM fo
 2. **Connector baked into the image.** The Kafka connector and its dependencies are resolved at build time into an Ivy cache (`spark-job/Dockerfile`), so `docker compose up` needs no Maven Central. The base image is the explicit `apache/spark:4.1.3-python3` tag, so the Python that PySpark needs is part of the tag's contract.
 3. **Listeners.** Kafka 4.3 in KRaft mode has an `INTERNAL` listener (`kafka:9092`, for containers) and an `EXTERNAL` one (`localhost:29092`, for clients on your machine). Only the external one is published, and only on 127.0.0.1 (checked by `tests/check_compose.py`, which is first run against a bad sample config and must flag it).
 4. **Producer durability.** `acks=all` with idempotence, delivery callbacks that count failures, and a SIGTERM handler that calls `flush()` before exiting, with a 30 second stop grace period in compose.
-5. **Upsert, not append.** `outputMode("update")` re-emits a window's aggregate on every trigger, so the sink must be an `INSERT ... ON CONFLICT DO UPDATE`. That also makes a replayed batch harmless.
+5. **Malformed events do not stop the stream** (reproduced in the smoke test). `from_json` turns bad JSON or a wrongly typed field into NULLs, and a NULL `product` violates the table's NOT NULL constraint, so one bad event failed the sink and the restarted job replayed and failed on it again, forever. Events that are not a JSON object, or lack `product`, a valid `ts`, `price` or `quantity`, are now filtered out of the aggregation and written to `dead_letter_events` (topic, partition, offset, raw value, reason) by a second streaming query with its own checkpoint. Replays do not duplicate rows.
+6. **Upsert, not append.** `outputMode("update")` re-emits a window's aggregate on every trigger, so the sink must be an `INSERT ... ON CONFLICT DO UPDATE`. That also makes a replayed batch harmless.
 
-6. **Schema baked into the Postgres image.** `postgres-init/Dockerfile` copies the init SQL into `/docker-entrypoint-initdb.d/` instead of bind-mounting it. A bind mount from a path the Docker VM cannot see (for example a copy under macOS `$TMPDIR` with colima, or a remote daemon) arrives empty, the table is never created and the Spark job fails at its first write. Also, a failed run leaves the Postgres volume initialized, so run `make reset` before retrying.
+7. **Schema baked into the Postgres image.** `postgres-init/Dockerfile` copies the init SQL into `/docker-entrypoint-initdb.d/` instead of bind-mounting it. A bind mount from a path the Docker VM cannot see (for example a copy under macOS `$TMPDIR` with colima, or a remote daemon) arrives empty, the table is never created and the Spark job fails at its first write. Also, a failed run leaves the Postgres volume initialized, so run `make reset` before retrying.
 
 Topics are created by a `kafka-init` service and auto-creation is off, so a typo in a topic name fails instead of creating an empty topic.
 
@@ -46,8 +47,9 @@ Topics are created by a `kafka-init` service and auto-creation is off, so a typo
 `make test` runs `tests/check_compose.py` (pinned image tags, loopback-only ports, in the compose file and all Dockerfiles), then `tests/smoke.sh`.
 
 Proves:
-- the stack starts from scratch and aggregated rows with a non-zero order count reach Postgres;
-- the producer received delivery confirmations;
+- the stack starts from clean volumes (the test deletes them first, so rows and logs of earlier runs cannot satisfy a check) and aggregated rows with a non-zero order count reach Postgres;
+- the producer logged its first delivery confirmation (waited for with a deadline);
+- three malformed events (not JSON, no product, no event time) followed by one uniquely marked good event: the marked event still gets aggregated, the three land in `dead_letter_events`, and the Spark job never restarts;
 - the external listener is published on 127.0.0.1;
 - a Spark checkpoint exists on the volume.
 
@@ -56,6 +58,7 @@ Does NOT prove:
 - Behavior under broker failure, rebalances or a slow Postgres.
 - Exactly-once delivery. The path is at-least-once into Postgres, made safe by the upsert.
 - Anything about late data beyond the 1 minute watermark.
+- That every kind of bad event is caught: the filter checks the four fields the table needs, not value ranges (a negative quantity is accepted).
 - That the base image tags are current: they are pinned, not verified against a registry by this test.
 
 ## Local demo vs production
@@ -63,7 +66,7 @@ Does NOT prove:
 One broker with replication factor 1, no authentication or TLS, one Spark process in local mode, a Postgres with a password from `.env`. For production you also need:
 - 3 brokers, `min.insync.replicas=2`, authentication and TLS on the listeners;
 - Spark on a cluster manager, with checkpoints on durable shared storage (HDFS or object storage), not a local volume;
-- a schema for the events (schema registry) instead of "whatever JSON arrives", and a dead-letter path for events that fail to parse: today they become NULL columns;
+- a schema for the events (schema registry) instead of "whatever JSON arrives", and alerting on the size of `dead_letter_events` and a way to replay it;
 - monitoring of consumer lag and of the streaming query's progress;
 - retention and compaction settings chosen for the topic.
 
@@ -71,4 +74,4 @@ One broker with replication factor 1, no authentication or TLS, one Spark proces
 
 `producer/producer.py` shows the durable producer settings; `spark-job/Dockerfile` shows how to bake the connector into the image; the Kafka block of `docker-compose.yml` is a working single-node KRaft setup with two listeners. The whole folder also works on its own: `cp -r data/kafka-spark-pipeline /elsewhere && cd /elsewhere && make test`.
 
-Pins: Apache Kafka 4.3.1, Apache Spark 4.1.3 with `spark-sql-kafka-0-10_2.13:4.1.3` (Spark 4 is built for Scala 2.13), PostgreSQL 18.6, psycopg 3.3.6, confluent-kafka 2.15.1 on Python 3.12.
+Pins: Apache Kafka 4.3.1, Apache Spark 4.1.3 with `spark-sql-kafka-0-10_2.13:4.1.3` (Spark 4 is built for Scala 2.13), PostgreSQL 18.6, psycopg 3.3.6, confluent-kafka 2.15.1 on Python 3.14.7 (`python:3.14.7-slim`, producer image).

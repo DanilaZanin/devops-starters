@@ -3,9 +3,16 @@
 # co.elastic.logs/enabled label no longer decides anything. Do not use this; the
 # smoke test swaps it in to prove that its "unlabeled logs must not appear" check
 # really fails when opt-in is broken.
+#
+# The one addition is the drop_event processor at the end. It is test isolation: the
+# broken input would otherwise read every container on the Docker host, and the smoke
+# test must not ship a stranger's logs. Only containers of this compose project reach
+# Elasticsearch; the unlabeled quiet-app is one of them, which is all the test needs.
 filebeat.autodiscover:
   providers:
     - type: docker
+      # docker-proxy allows read-only calls only; there is no Docker socket in this container.
+      host: "tcp://docker-proxy:2375"
       hints.enabled: true
       hints.default_config:
         type: filestream
@@ -18,7 +25,13 @@ filebeat.autodiscover:
           - /var/lib/docker/containers/${data.container.id}/*.log
 
 processors:
-  - add_docker_metadata: ~
+  - add_docker_metadata:
+      host: "tcp://docker-proxy:2375"
+  - drop_event:
+      when:
+        not:
+          equals:
+            container.labels.com_docker_compose_project: elk-filebeat
 
 setup.ilm.enabled: false
 setup.template.enabled: false

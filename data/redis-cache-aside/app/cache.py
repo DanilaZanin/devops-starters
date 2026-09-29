@@ -32,6 +32,18 @@ end
 return 0
 """
 
+# Cache the value and release the lock in one atomic step, and only if the lock is
+# still ours. A loader that outlived its lease must not overwrite the value that the
+# new lock owner cached in the meantime. Returns 1 if stored, 0 if the lease was lost.
+_STORE_AND_RELEASE = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  redis.call('set', KEYS[2], ARGV[2], 'EX', ARGV[3])
+  redis.call('del', KEYS[1])
+  return 1
+end
+return 0
+"""
+
 Loader = Callable[[], Awaitable[Any]]
 
 
@@ -65,6 +77,8 @@ class CacheAside:
     def __init__(self, client: aioredis.Redis, settings: Settings) -> None:
         self.client = client
         self.settings = settings
+        # One fallback load per key per process (see _bypass).
+        self._inflight: dict[str, asyncio.Future] = {}
 
     async def get_or_load(self, key: str, loader: Loader) -> tuple[Any, str]:
         """Return (value, status). Status is one of:
@@ -72,6 +86,11 @@ class CacheAside:
         miss       this request took the lock, loaded the value and cached it
         coalesced  another request loaded it while this one waited
         bypass     Redis was unusable (or the wait timed out): served from the source
+
+        Timing: a request waits at most `lock_wait_s` for the lock holder. Keep that
+        above the lock lease (`lock_ttl_ms`): then a dead holder's lock expires while
+        the waiters are still polling, and exactly one of them takes over. If the wait
+        runs out anyway, the fallback loads of one process are merged into one.
         """
         s = self.settings
         lock_key = f"{key}:lock"
@@ -95,7 +114,18 @@ class CacheAside:
         except CacheUnavailable as exc:
             # Fail open: a broken cache must cost latency, not availability.
             log.warning("cache unavailable (%s), serving from the source", exc)
-        return await loader(), "bypass"
+        return await self._bypass(key, loader), "bypass"
+
+    async def _bypass(self, key: str, loader: Loader) -> Any:
+        """Load without the lock, but let concurrent bypass requests for one key share
+        a single call to the source. Bounds the cost of a dead Redis or a spent wait
+        budget to one call per key per process instead of one per request.
+        ponytail: per process; across replicas it is still one call each."""
+        task = self._inflight.get(key)
+        if task is None:
+            task = self._inflight[key] = asyncio.ensure_future(loader())
+            task.add_done_callback(lambda _: self._inflight.pop(key, None))
+        return await asyncio.shield(task)
 
     async def invalidate(self, key: str) -> None:
         """Drop a cached value. Raises CacheUnavailable if Redis cannot be reached, so
@@ -103,23 +133,32 @@ class CacheAside:
         await self._redis(self.client.delete(key))
 
     async def _load_holding_lock(self, key: str, lock_key: str, token: str, loader: Loader) -> tuple[Any, str]:
+        settled = False  # True once _store_and_release ran: the lock is gone or not ours any more
         try:
             # Someone may have filled the key between our GET and taking the lock.
             raw = await self._redis(self.client.get(key))
             if raw is not None:
                 return json.loads(raw), "hit"
             value = await loader()
-            await self._store(key, value)
+            settled = True
+            await self._store_and_release(key, lock_key, token, value)
             return value, "miss"
         finally:
-            await self._release(lock_key, token)
+            if not settled:
+                await self._release(lock_key, token)
 
-    async def _store(self, key: str, value: Any) -> None:
+    async def _store_and_release(self, key: str, lock_key: str, token: str, value: Any) -> None:
         try:
-            await self.client.set(key, json.dumps(value), ex=self.settings.ttl_seconds)
+            stored = await self.client.eval(
+                _STORE_AND_RELEASE, 2, lock_key, key, token, json.dumps(value), self.settings.ttl_seconds
+            )
         except REDIS_ERRORS as exc:
             # The value is already loaded; failing to cache it is not worth an error.
+            # The lock expires by itself.
             log.warning("could not cache %s: %s", key, exc)
+            return
+        if not stored:
+            log.warning("lock for %s expired before the load finished, result not cached", key)
 
     async def _release(self, lock_key: str, token: str) -> None:
         try:

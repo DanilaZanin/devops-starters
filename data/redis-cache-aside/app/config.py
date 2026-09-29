@@ -15,10 +15,13 @@ class Settings:
     ttl_seconds: int = 30
     # A loader may hold the per-key lock for at most this long. If the process
     # holding it dies, the lock expires by itself and someone else takes over.
+    # A loader that runs longer loses the lock and its result is not cached.
     lock_ttl_ms: int = 5000
-    # How long requests that lost the lock wait for the winner before they give up
-    # and load the value themselves.
-    lock_wait_s: float = 2.0
+    # How long requests that lost the lock wait for the winner. Keep it above
+    # lock_ttl_ms, so a dead holder's lock expires while the waiters still poll
+    # and one of them takes over. After that, waiters load the value themselves
+    # (merged into one call per key per process).
+    lock_wait_s: float = 6.0
     poll_interval_s: float = 0.02
     # Bounds every Redis call, so a hung Redis costs a request at most this long.
     socket_timeout_s: float = 0.25
@@ -31,5 +34,7 @@ class Settings:
             redis_port=int(os.environ.get("REDIS_PORT", cls.redis_port)),
             redis_password=os.environ.get("REDIS_PASSWORD", cls.redis_password),
             ttl_seconds=int(os.environ.get("CACHE_TTL_SECONDS", cls.ttl_seconds)),
+            lock_ttl_ms=int(os.environ.get("LOCK_TTL_MS", cls.lock_ttl_ms)),
+            lock_wait_s=float(os.environ.get("LOCK_WAIT_S", cls.lock_wait_s)),
             source_latency_s=float(os.environ.get("SOURCE_LATENCY_S", cls.source_latency_s)),
         )

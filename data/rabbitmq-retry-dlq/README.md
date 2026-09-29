@@ -18,7 +18,7 @@ make demo    # starts the consumer and publishes 4 sample messages
 make reset   # removes containers and data
 ```
 
-Expected `make test` result: `8 passed`. Expected `make demo` tail, once the retries have run out (about 15 seconds):
+Expected `make test` result: `14 passed`. Expected `make demo` tail, once the retries have run out (about 15 seconds):
 
 ```
 name           messages_ready  messages_unacknowledged
@@ -33,15 +33,17 @@ Requirements: docker with compose v2, [uv](https://docs.astral.sh/uv/), make. `m
 
 | Verified on | RAM | First run (cold image cache) |
 |---|---|---|
-| 2026-09-29, macOS arm64, colima 4 CPU / 8 GB, RabbitMQ 4.3.6, `make test`: 8 passed (not yet run on an ubuntu-24.04 runner) | about 120 MiB (RabbitMQ container, sampled with `docker stats`) | about 29 s including the image pull; about 19 s with the image cached |
+| 2026-09-29, macOS arm64, colima 4 CPU / 8 GB, RabbitMQ 4.3.6, `make test`: 14 passed (not yet run on an ubuntu-24.04 runner) | about 120 MiB (RabbitMQ container, sampled with `docker stats`) | about 30 s including the image pull; about 35 s with the image cached (quorum queues and the dead-letter scenarios add wait time) |
 
 ## Traps this avoids
 
 1. **Poison message loops forever** (reproduced in tests). Invalid JSON goes straight to the DLQ with the parse error in the `x-last-error` header, without retries. The good message behind it is processed.
 2. **Republish + ack without confirms loses messages** (reproduced in tests). Retry and DLQ publishes use a confirm-mode channel with `mandatory=True`. If the broker cannot route or accept the copy, the original is nacked back to the queue instead of acked.
-3. **Retry count is bounded.** `MAX_RETRIES=3` means one first attempt plus exactly three retries (four handler calls), then the DLQ. The count travels in the `x-retry-count` header.
-4. **Default `guest` user and open ports.** The broker is started with a user from `.env` (which replaces `guest`), and ports are published on 127.0.0.1 only.
-5. **`depends_on: service_healthy` is not a guarantee.** `rabbitmq-diagnostics ping` can pass before the AMQP listener accepts connections. The healthcheck uses `check_port_connectivity`, and `connect()` retries anyway.
+3. **Garbage in the retry-count header kills the consumer** (reproduced in tests). `x-retry-count` comes from the wire. If it is not a non-negative integer, the message goes to the DLQ like any other poison message. Parsed outside the protected block, `int("bad")` crashes the consumer before the ack, and with `restart: unless-stopped` it crash-loops on the same message forever.
+4. **The TTL to main hop is at-most-once in a classic queue** (reproduced in tests). Publisher confirms cover the consumer's publish into the retry queue, not the broker-internal dead-lettering from the retry queue back to `orders`. If `orders` refuses the message at that moment (full with `reject-publish`, leader unavailable), a classic queue drops it. The queues here are quorum queues and the retry queue uses `x-dead-letter-strategy: at-least-once`, which keeps the message and retries the hop. See [Dead Letter Exchanges](https://www.rabbitmq.com/docs/dlx) in the RabbitMQ docs (the safety section).
+5. **Retry count is bounded.** `MAX_RETRIES=3` means one first attempt plus exactly three retries (four handler calls), then the DLQ. The count travels in the `x-retry-count` header.
+6. **Default `guest` user and open ports.** The broker is started with a user from `.env` (which replaces `guest`), and ports are published on 127.0.0.1 only.
+7. **`depends_on: service_healthy` is not a guarantee.** `rabbitmq-diagnostics ping` can pass before the AMQP listener accepts connections. The healthcheck uses `check_port_connectivity`, and `connect()` retries anyway.
 
 ## What the test proves / does NOT prove
 
@@ -50,6 +52,9 @@ The tests run a broken consumer (`traps/broken_consumer.py`) and the real one (`
 Proves:
 - with a poison message at the head of the queue, the broken consumer never dead-letters anything and the good message is not handled; the real consumer dead-letters the poison message and handles the good one;
 - when the retry queue has disappeared, the broken consumer acks and loses the message; the real one keeps it;
+- with a poison message at the head of the queue, the broken consumer is redelivered the same message over and over (at least 3 deliveries counted), the good message behind it is never handled and nothing reaches the DLQ; the real one sees the poison message exactly once;
+- a garbage `x-retry-count` header (`"bad"`, `-1`, `1.5`) crash-loops the broken consumer across restarts; the real one dead-letters it and still handles the next message;
+- when the main queue is full at the moment the TTL fires, a classic retry queue drops the message and the quorum one delivers it once space frees up;
 - a failing message is handled exactly `MAX_RETRIES + 1` times, then lands in the DLQ with its error and retry count;
 - a message that recovers on a retry is not dead-lettered;
 - `guest/guest` is rejected.
@@ -59,16 +64,17 @@ Does NOT prove:
 - The message-loss trap is reproduced by deleting the retry queue while the consumer runs. Other causes (a broker resource alarm, a network drop between publish and confirm) are not tested.
 - Broker restarts, disk persistence and clustering.
 - Throughput. A confirm per message is slow; at volume you batch confirms.
-- Quorum queues. RabbitMQ 4.0 and later give quorum queues a default delivery limit, which changes how the requeue loop ends. These tests use classic queues.
+- The limits of at-least-once dead-lettering. It protects a destination that is refusing or unavailable. It does not help when the destination exchange has no matching binding: that is an unroutable message and the broker discards it as delivered. It also needs the destination to be a quorum queue; a classic destination gets no guarantee. One node only, so leader failover is not exercised.
+- The quorum delivery limit. RabbitMQ 4.x quorum queues drop a message after 20 redeliveries by default (no DLX is configured on `orders`). The consumer only requeues when a confirmed publish fails, so it is unlikely to reach that, but a long broker outage could.
 
 ## Local demo vs production
 
 This runs one node, over plain AMQP, with the password in a local `.env`. For production you also need:
 - TLS on AMQP and on the management port, credentials from a secrets manager;
-- quorum queues (or streams) and a cluster if you cannot lose the node;
+- a cluster (3 nodes) so quorum queues can actually fail over; here they run on one node;
 - an alert on the DLQ depth, and a way to replay or discard dead letters;
 - idempotent handlers (see above) and a backoff that grows: a single fixed `RETRY_DELAY_MS` hammers a failing dependency at a constant rate;
-- changing `RETRY_DELAY_MS` on a live broker fails with `PRECONDITION_FAILED`, because queue arguments cannot be redeclared. Plan a migration or a new queue name; here `make reset` deletes the data.
+- changing `RETRY_DELAY_MS` on a live broker fails with `PRECONDITION_FAILED`, because queue arguments cannot be redeclared. Plan a migration or a new queue name; here `make reset` deletes the data. The same applies if you point this code at an existing broker that has classic `orders` queues.
 
 ## Copy it into your project
 
@@ -82,4 +88,4 @@ app/handlers.py    your business logic goes here
 
 Keep `pyproject.toml` (or the pinned `requirements.txt`), the `Dockerfile` and `.env.example`. Copy `tests/` and `traps/` too if you want the same guarantees for your handler. The whole folder also works on its own: `cp -r data/rabbitmq-retry-dlq /elsewhere && cd /elsewhere && make test`.
 
-Pins: RabbitMQ 4.3.6 (management image), pika 1.4.4, Python 3.12.
+Pins: RabbitMQ 4.3.6 (management image), pika 1.4.4, Python 3.14.7 (`python:3.14.7-slim`).

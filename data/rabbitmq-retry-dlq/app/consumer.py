@@ -19,15 +19,23 @@ Handler = Callable[[dict, int], None]
 
 
 def attempt_of(properties) -> int:
-    """How many retries this message has already been through (0 on first delivery)."""
-    return int((properties.headers or {}).get("x-retry-count", 0))
+    """How many retries this message has already been through (0 on first delivery).
+
+    The header comes from the wire, so it is untrusted: anything but a
+    non-negative integer is poison metadata and raises InvalidMessage.
+    """
+    value = (properties.headers or {}).get("x-retry-count", 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise InvalidMessage(f"invalid x-retry-count header: {value!r}")
+    return value
 
 
 def handle_delivery(channel, publisher, method, properties, body: bytes, settings: Settings, handler: Handler) -> None:
-    attempt = attempt_of(properties)
+    attempt = 0
     target = None  # (exchange, routing_key, headers) when the message has to move on
 
     try:
+        attempt = attempt_of(properties)  # inside the protected block: a bad header must not kill the consumer
         handler(decode_message(body), attempt)
     except InvalidMessage as exc:
         # Poison message: no number of retries can fix it, so do not retry.
