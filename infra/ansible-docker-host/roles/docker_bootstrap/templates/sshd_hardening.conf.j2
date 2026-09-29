@@ -1,0 +1,5 @@
+# Managed by Ansible (role docker_bootstrap). Do not edit by hand.
+# Read before 50-cloud-init.conf on purpose: sshd keeps the first value it sees.
+Port {{ docker_bootstrap_ssh_port }}
+PasswordAuthentication {{ 'no' if docker_bootstrap_ssh_disable_password_auth | bool else 'yes' }}
+PermitRootLogin {{ 'no' if docker_bootstrap_ssh_disable_root_login | bool else 'prohibit-password' }}

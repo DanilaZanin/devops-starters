@@ -1,0 +1,7 @@
+---
+# Test-only: community.docker is used by the molecule docker driver.
+collections:
+  - name: community.general
+    version: "13.4.0"
+  - name: community.docker
+    version: "5.3.0"

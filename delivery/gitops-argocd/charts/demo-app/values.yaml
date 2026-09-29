@@ -2,10 +2,15 @@ replicaCount: 1
 
 image:
   repository: nginxinc/nginx-unprivileged
-  tag: "1.27-alpine"
+  # Pin an exact tag (or a digest) for real workloads.
+  tag: "1.30.2-alpine"
   pullPolicy: IfNotPresent
 
 containerPort: 8080
+
+# nginx-unprivileged runs as uid 101.
+securityContext:
+  runAsUser: 101
 
 resources:
   requests:
@@ -21,10 +26,12 @@ service:
 
 ingress:
   enabled: false
+  className: nginx
   host: demo-app.local
 
-# Rendered straight into an env ConfigMap so we can prove per-environment
-# overrides actually flow through the pipeline (see environments/*.yaml).
+# Rendered into an env ConfigMap and injected with envFrom. Env vars are read
+# once at container start, so a change only takes effect when the pod restarts:
+# the Deployment carries a checksum/config annotation to force that (see README).
 env:
   APP_ENV: "base"
 
@@ -33,3 +40,7 @@ autoscaling:
   minReplicas: 1
   maxReplicas: 3
   targetCPUUtilizationPercentage: 75
+
+podDisruptionBudget:
+  enabled: false
+  maxUnavailable: 1

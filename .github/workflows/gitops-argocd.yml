@@ -1,0 +1,60 @@
+name: gitops-argocd
+
+on:
+  pull_request:
+    paths:
+      - "delivery/gitops-argocd/**"
+      - ".github/workflows/gitops-argocd.yml"
+  push:
+    branches: [main]
+    paths:
+      - "delivery/gitops-argocd/**"
+      - ".github/workflows/gitops-argocd.yml"
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  KUBECONFORM_VERSION: v0.8.0
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # kind, kubectl and helm are preinstalled on GitHub's ubuntu runners.
+      - name: Install kubeconform
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/kubeconform.tgz" \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/kubeconform.tgz" -C "$RUNNER_TEMP" kubeconform
+          sudo install -m 0755 "$RUNNER_TEMP/kubeconform" /usr/local/bin/kubeconform
+
+      - name: Show tool versions
+        run: |
+          docker version --format '{{.Server.Version}}'
+          kind version
+          kubectl version --client
+          helm version --short
+          kubeconform -v
+
+      # Copies the module out of the repo so a hidden dependency on the root
+      # shows up as a failure, then runs the full suite in the copy.
+      - name: copy-test (make test in a copy of the module)
+        run: |
+          dest="$RUNNER_TEMP/gitops-argocd"
+          cp -r delivery/gitops-argocd "$dest"
+          make -C "$dest" test
+
+      - name: Clean up kind cluster
+        if: always()
+        run: make -C "$RUNNER_TEMP/gitops-argocd" down || true

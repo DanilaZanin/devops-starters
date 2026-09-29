@@ -1,109 +1,182 @@
+# lint -> test -> build -> plan (MR and default branch) -> apply (default branch only)
+# Policy for this file is enforced by checks/pipeline_policy.py (see README).
 stages:
   - lint
   - test
   - build
-  - terraform-plan
-  - terraform-apply
+  - plan
+  - apply
+
+# One pipeline per MR, one on the default branch; no duplicate branch pipelines.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 variables:
   TF_ROOT: ${CI_PROJECT_DIR}/terraform
   IMAGE_TAG: ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}
 
-.python_base:
-  image: python:3.12-slim
-  before_script:
-    - pip install --quiet -r app/requirements.txt
+# ---------------------------------------------------------------- lint / test
 
-lint:
+.python_base:
+  image: python:3.14-slim
+  before_script:
+    - pip install --quiet -r requirements-dev.txt
+
+lint:python:
   extends: .python_base
   stage: lint
   script:
-    - ruff check app/ tests/
+    - ruff check app/ tests/ checks/
 
-test:
+test:python:
   extends: .python_base
   stage: test
   script:
-    - pytest tests/ -v --junitxml=report.xml
+    - pytest -v --junitxml=report.xml
   artifacts:
     when: always
     reports:
       junit: report.xml
 
+# The hashicorp/terraform and aquasec/trivy images set ENTRYPOINT to their own
+# binary. GitLab runs the job script through a shell, so without an empty
+# entrypoint every script line becomes an argument to terraform/trivy
+# (`terraform sh -c ...`). That is what `entrypoint: [""]` prevents.
+.terraform:
+  image:
+    name: hashicorp/terraform:1.16.4
+    entrypoint: [""]
+  services:
+    - docker:29-dind
+  variables:
+    # The demo target is a container on this job's dind daemon.
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    TF_INPUT: "false"
+    TF_IN_AUTOMATION: "true"
+    TF_STATE_NAME: staging
+    # GitLab-managed Terraform state, one state per environment.
+    TF_HTTP_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_STATE_NAME}
+    TF_HTTP_LOCK_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_STATE_NAME}/lock
+    TF_HTTP_LOCK_METHOD: POST
+    TF_HTTP_UNLOCK_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_STATE_NAME}/lock
+    TF_HTTP_UNLOCK_METHOD: DELETE
+    TF_HTTP_USERNAME: gitlab-ci-token
+    TF_HTTP_PASSWORD: ${CI_JOB_TOKEN}
+    TF_HTTP_RETRY_WAIT_MIN: "5"
+  before_script:
+    # The lock file is committed; readonly makes init fail instead of silently
+    # picking a different provider version.
+    - cd "$TF_ROOT"
+    - terraform init -lockfile=readonly
+
+lint:terraform:
+  image:
+    name: hashicorp/terraform:1.16.4
+    entrypoint: [""]
+  stage: lint
+  script:
+    - cd "$TF_ROOT"
+    - terraform fmt -check -recursive
+    - terraform init -backend=false -lockfile=readonly
+    - terraform validate
+
+lint:trivy:
+  image:
+    name: aquasec/trivy:0.74.0
+    entrypoint: [""]
+  stage: lint
+  script:
+    # `trivy config` takes exactly one target, so one call per directory.
+    - trivy config --exit-code 1 --severity HIGH,CRITICAL terraform
+    - trivy config --exit-code 1 --severity HIGH,CRITICAL app
+
+# ---------------------------------------------------------------------- build
+
 build:
   stage: build
-  image: docker:27
+  image: docker:29
   services:
-    - docker:27-dind
+    - docker:29-dind
   variables:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""
   script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - docker build -t "$IMAGE_TAG" app/
-    # would `docker push` here against a real registry; left as a comment
-    # since this template doesn't assume you have one configured:
-    # - docker push "$IMAGE_TAG"
+    # Merge request pipelines build only; the default branch also pushes.
+    - 'if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then docker push "$IMAGE_TAG"; fi'
+
+# ----------------------------------------------------------------- plan/apply
+
+# Plans run in merge requests (review what will change) and on the default branch.
+# Plan files can contain sensitive values: keep the expiry short.
+.plan:
+  extends: .terraform
+  stage: plan
   rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-
-.terraform_base:
-  # the hashicorp/terraform image sets ENTRYPOINT to the terraform binary
-  # itself, so plain `image: hashicorp/terraform:1.10` makes every job
-  # command run as `terraform <script line>` instead of a shell - has to be
-  # overridden to actually run multi-line scripts.
-  image:
-    name: hashicorp/terraform:1.10
-    entrypoint: [""]
-  before_script:
-    - cd "$TF_ROOT"
-    - terraform init -input=false
-
-terraform-plan:staging:
-  extends: .terraform_base
-  stage: terraform-plan
   script:
-    - terraform plan -input=false -var="environment=staging" -out=staging.tfplan
+    - terraform plan -lock=false -var="environment=${TF_STATE_NAME}" -out="${TF_STATE_NAME}.tfplan"
+    - terraform show -no-color "${TF_STATE_NAME}.tfplan" > "${TF_STATE_NAME}.plan.txt"
+
+plan:staging:
+  extends: .plan
+  variables:
+    TF_STATE_NAME: staging
   artifacts:
     paths:
       - terraform/staging.tfplan
-    expire_in: 1 hour
-  environment:
-    name: staging
+      - terraform/staging.plan.txt
+    expire_in: 1 day
 
-terraform-apply:staging:
-  extends: .terraform_base
-  stage: terraform-apply
-  needs: ["terraform-plan:staging"]
-  script:
-    - terraform apply -input=false staging.tfplan
-  environment:
-    name: staging
-  rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-
-terraform-plan:production:
-  extends: .terraform_base
-  stage: terraform-plan
-  script:
-    - terraform plan -input=false -var="environment=production" -out=production.tfplan
+plan:production:
+  extends: .plan
+  variables:
+    TF_STATE_NAME: production
   artifacts:
     paths:
       - terraform/production.tfplan
-    expire_in: 1 hour
+      - terraform/production.plan.txt
+    expire_in: 1 day
+
+# Applies consume the exact plan file from the same pipeline, and never run in
+# merge requests. resource_group serializes applies per environment.
+.apply:
+  extends: .terraform
+  stage: apply
+  script:
+    - terraform apply -input=false "${TF_STATE_NAME}.tfplan"
+
+apply:staging:
+  extends: .apply
+  needs:
+    - plan:staging
+  variables:
+    TF_STATE_NAME: staging
+  resource_group: staging
   environment:
-    name: production
+    name: staging
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
-terraform-apply:production:
-  extends: .terraform_base
-  stage: terraform-apply
-  needs: ["terraform-plan:production"]
-  script:
-    - terraform apply -input=false production.tfplan
+apply:production:
+  extends: .apply
+  needs:
+    - plan:production
+  variables:
+    TF_STATE_NAME: production
+  resource_group: production
   environment:
     name: production
-  # production never applies automatically - someone has to click it
-  when: manual
+  # A person presses the button; allow_failure: false keeps the pipeline
+  # "blocked" instead of "passed" while nobody has.
+  allow_failure: false
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual

@@ -1,12 +1,15 @@
+# Staging follows main and syncs automatically.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: demo-app-staging
   namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
 spec:
-  project: default
+  project: demo-app
   source:
-    repoURL: https://github.com/YOUR_USERNAME/gitops-helm-argocd-starter.git
+    repoURL: https://github.com/YOUR_ORG/YOUR_REPO.git
     targetRevision: main
     path: charts/demo-app
     helm:

@@ -1,132 +1,162 @@
-# terraform-modules-starter
+# Terraform replicas fail with "port is already allocated": local module starter on the Docker provider
 
-A small set of reusable Terraform modules — `network`, `security-group`, `compute` —
-built around the classic "VPC + SG + instances" shape you'd use on any cloud, but
-wired up against the Docker provider so the whole thing is runnable on a laptop
-with just `docker` installed, no cloud account required.
+Level: **lab** (native `terraform test` and validation in CI; `make up` applies for real on a local Docker).
 
-## Why Docker as the backend
+Three small Terraform modules (`network`, `security-group`, `compute`) in the classic
+"VPC + security group + instances" shape, implemented on the Docker provider so
+they run on a laptop with no cloud account. **This is a teaching model of module
+interfaces, not production infrastructure**: the value is the module structure,
+input validation and tests, not the Docker resources behind them.
 
-I wanted modules I could actually `terraform apply` and poke at, not just lint.
-Docker gives real resources (networks, containers, published ports) with the
-same lifecycle semantics as a cloud provider, so the modules exercise real
-`create/update/destroy` behavior instead of being a `local_file` demo.
+## Problem
 
-The module *interfaces* are written to look like their cloud equivalents
-(`ingress_rules` shaped like an AWS security group rule, `count_` like an ASG
-desired count) specifically so swapping the provider block later is a matter
-of rewriting `main.tf` inside each module, not touching any code that calls them.
+A module that creates N copies of a container publishes the same host port for every
+copy. The first container starts; the second fails at `terraform apply` with the Docker
+daemon's `Bind for 0.0.0.0:8080 failed: port is already allocated`, halfway through an
+apply that has already created other resources. Nothing at plan time warns you.
 
-## Structure
+The `compute` module computes the published ports in one `locals` block and offsets the
+host port by the replica index (8080, 8081, ...). Its tests assert the planned ports, so
+the mistake shows up in `terraform test` in seconds, without a Docker daemon.
 
-```
-modules/
-  network/         # docker_network  ~ VPC/subnet
-  security-group/  # validates + normalizes firewall rules ~ AWS security_group
-  compute/         # docker_container ~ EC2 instance / ASG
-examples/
-  docker-sandbox/  # wires the three modules into a 2-replica nginx deployment
-```
-
-## Usage
+## Quick start
 
 ```bash
-cd examples/docker-sandbox
-terraform init
-terraform plan
-terraform apply
+make check-prereqs   # terraform >= 1.7
+make test            # fmt, tflint (if installed), validate, terraform test, trap
 ```
 
-This creates:
-- a dedicated Docker network (`sandbox-net`, 10.30.0.0/24)
-- a validated security-group object allowing inbound TCP/8080
-- two `nginx-unprivileged` containers (listens on 8080, not the usual 80 —
-  needed so the internal/external port in the security-group rule actually
-  matches what the process binds to) on that network, published as 8080 and
-  8081 on the host (the compute module offsets the external port per replica
-  so multiple instances never collide on the same host port)
+`make test` runs `terraform fmt -check`, `tflint` when installed, `terraform init` and
+`validate` in every module and the example, and `terraform test` in each (native tests
+against a mocked docker provider: no daemon needed, the provider is still downloaded
+by `init`). The last step builds a broken copy of `modules/compute` without the port
+offset and requires its tests to fail on the distinct-ports assertion:
 
-Verify it worked:
-
-```bash
-curl -sI http://localhost:8080
-curl -sI http://localhost:8081
+```
+OK: without the offset, terraform test fails on 'replicas must publish distinct host ports'.
 ```
 
-Tear down:
+`make up` applies `examples/docker-sandbox` on your local Docker (two nginx containers on
+127.0.0.1:8080 and :8081) and curls them; `make down` destroys them; `make reset` also
+removes `.terraform` directories and local state.
 
-```bash
-terraform destroy
-```
+| | Status |
+|---|---|
+| macOS arm64 + colima (4 CPU / 8 GB) | verified 2026-09-29: `make test` green (also from a copied directory); `make up` and `make down` applied and destroyed 5 resources on colima. Terraform 1.16.4, kreuzwerker/docker 4.6.0, tflint 0.64.0 (via its docker image, clean) |
+| ubuntu-24.04 GitHub runner | CI only, not measured here; see `.github/workflows/terraform-docker-modules.yml` |
+| First-run time | `make test` about 18 s with a cold provider cache (about 11 s from a copied directory); `make up` about 8 s with the image already local |
+| RAM | `make test` starts no containers; `make up` runs two nginx containers (a few MB each, not measured separately) |
+
+## Traps this avoids
+
+1. **Replicas collide on the host port** (reproduced in tests). One `locals` block feeds
+   both the containers and the `published_ports` output, with the replica index added
+   to the external port.
+2. **Silently ignored inputs.** Docker cannot filter published ports by source
+   address, so the security-group module rejects any `cidr` other than `0.0.0.0/0`
+   instead of accepting a value that does nothing.
+3. **Ports exposed on every interface.** Published ports bind to `127.0.0.1` unless you
+   pass `bind_ip`.
+4. **Port opened is not the port the process binds.** The example uses
+   `nginxinc/nginx-unprivileged`, which listens on 8080, matching the rule. The image
+   also runs as non-root and has a health check in the example.
+5. **Typos found at apply time.** Ports outside 1..65535, unknown protocols, invalid
+   subnets and `replicas < 1` fail at plan time (each has a test).
+
+## What the test proves / does NOT prove
+
+Proves:
+
+- With a mocked provider, the compute module plans distinct host ports and indexed
+  names for N replicas, keeps the plain name and port for one, and defaults to
+  loopback. A copy without the offset fails those assertions.
+- The validations in all three modules reject bad input (`expect_failures`).
+- The example wires the modules into two replicas on `127.0.0.1:8080` and `:8081`.
+- Code is formatted and validates against the real provider schema.
+
+Does NOT prove:
+
+- That `apply` works in CI. `terraform test` runs `plan` against a mocked provider; nothing
+  talks to a Docker daemon there. `make up` is the manual check (run once by hand on colima).
+- The exact Docker error message from the Problem section is not reproduced; the test
+  checks the planned ports that would cause it.
+- That the modules map cleanly onto a real cloud. The interfaces are shaped like AWS
+  security-group rules and ASG capacity, but nothing here is tested against AWS.
+- Behavior of provider versions other than the one in the example's lock file (4.6.0).
+
+## Local demo vs production
+
+- The Docker provider has no real VPC, security group or load balancer. `network` is a
+  bridge network, `security-group` only normalizes and validates rules
+  (a `terraform_data` resource), and `compute` publishes ports on the host.
+- Real modules need remote state, provider version and lock file management for every
+  root module, tagging, IAM, and a review of every default.
+- Pin `image` to an exact tag or digest; the example uses the exact tag `1.30.2-alpine`.
+- Publishing on `0.0.0.0` (`bind_ip`) exposes the container to your network.
+
+## Copy it into your project
+
+Copy the directories under `modules/` you need (each has its own `versions.tf`, tests,
+and descriptions in `variables.tf` and `outputs.tf`), and keep
+`traps/port-offset.sh` with `compute` if you want the regression test. The example
+shows how the modules connect. The module has no references outside its directory.
 
 ## Module reference
 
 ### `modules/network`
+
 | Input | Type | Default | Description |
 |---|---|---|---|
-| `name` | string | — | Base name, gets `-net` suffix |
-| `subnet` | string | `10.20.0.0/24` | CIDR for the network |
+| `name` | string | required | Network is called `<name>-net` |
+| `subnet` | string | `10.20.0.0/24` | IPv4 CIDR, validated |
 | `labels` | map(string) | `{}` | Docker labels |
 
 Outputs: `network_id`, `network_name`
 
 ### `modules/security-group`
+
 | Input | Type | Default | Description |
 |---|---|---|---|
-| `name` | string | — | Name, used for the object identity |
+| `name` | string | required | Name of the group |
 | `ingress_rules` | list(object) | `[]` | `{ description, port, protocol = "tcp", cidr = "0.0.0.0/0" }` |
 
-Validates that ports are in `1..65535` and protocol is `tcp`/`udp` before
-anything gets applied — `terraform plan` fails fast on a typo'd port instead
-of failing at apply time.
-
-Outputs: `name`, `rules` (normalized `{ internal, external, protocol }` list,
-ready to feed straight into the compute module).
+Validated: port in 1..65535, protocol `tcp` or `udp`, `cidr` only `0.0.0.0/0`.
+Outputs: `name`, `rules` (normalized `{ description, internal, external, protocol }`).
 
 ### `modules/compute`
+
 | Input | Type | Default | Description |
 |---|---|---|---|
-| `name` | string | — | Base name |
-| `image` | string | — | Docker image |
-| `count_` | number | `1` | Number of replicas |
-| `network_id` / `network_name` | string | — | From the network module |
+| `name` | string | required | Base name, `-<index>` appended when `replicas > 1` |
+| `image` | string | required | Docker image; use one that runs as non-root |
+| `replicas` | number | `1` | Number of containers, at least 1 |
+| `network_name` | string | required | From the network module |
 | `security_group_rules` | list(object) | `[]` | From the security-group module |
-| `env` | map(string) | `{}` | Env vars |
-| `command` | list(string) | `null` | Override entrypoint |
+| `bind_ip` | string | `127.0.0.1` | Host address for published ports |
+| `env` | map(string) | `{}` | Environment variables |
+| `command` | list(string) | `null` | Override the image command |
+| `healthcheck` | object | `null` | `{ test, interval, timeout, retries }` |
 
-Outputs: `container_names`, `container_ips`
+Outputs: `container_names`, `container_ips`, `published_ports`
 
 ## Porting to a real cloud
 
-Because the module *inputs/outputs* mirror a cloud shape, porting to AWS is
-mostly a matter of rewriting the three `main.tf` files:
+The module inputs and outputs mirror a cloud shape, so porting means rewriting the
+resources inside each module:
 
-- `modules/network` → `aws_vpc` + `aws_subnet`
-- `modules/security-group` → `aws_security_group` + `aws_security_group_rule`
-  (the `rules` output already matches the shape `aws_instance` wants)
-- `modules/compute` → `aws_instance` or `aws_autoscaling_group`
+- `modules/network` to `aws_vpc` plus `aws_subnet`
+- `modules/security-group` to `aws_security_group` plus rules (`cidr` becomes meaningful)
+- `modules/compute` to `aws_instance` or an autoscaling group (the port offset goes
+  away; a load balancer replaces host ports)
 
-The `examples/docker-sandbox/main.tf` file wouldn't need to change at all.
+`examples/docker-sandbox` would change only where it depends on host ports.
 
-## Verified
-
-Ran end to end on a clean Ubuntu 22.04 box (Terraform 1.10.5, Docker Engine 27,
-kreuzwerker/docker 3.9.0):
+## Layout
 
 ```
-terraform init     -> OK
-terraform validate -> Success! The configuration is valid.
-terraform plan     -> Plan: 5 to add, 0 to change, 0 to destroy
-terraform apply    -> Apply complete! Resources: 5 added
-curl -sI http://localhost:8080 -> HTTP/1.1 200 OK (nginx/1.27.5)
-curl -sI http://localhost:8081 -> HTTP/1.1 200 OK (nginx/1.27.5)
-terraform destroy  -> Destroy complete! Resources: 5 destroyed
+modules/network/          docker_network, validation, tests/
+modules/security-group/   rule validation and normalization, tests/
+modules/compute/          docker_container replicas, port offset, tests/
+examples/docker-sandbox/  the three wired together, tests/, committed lock file
+traps/port-offset.sh      broken (no offset) copy of compute must fail its tests
 ```
-
-One real bug caught along the way: the first pass used the plain `nginx`
-image, which listens on port 80 by default — but the security-group rule
-(and therefore the published port) was 8080, so requests got a connection
-reset. Fixed by switching to `nginxinc/nginx-unprivileged`, which listens on
-8080 out of the box. Left it in this README because it's the kind of mismatch
-between "port I opened" and "port the process actually binds to" that's easy
-to hit with real cloud security groups too.

@@ -1,0 +1,51 @@
+name: gitlab-ci-terraform
+
+on:
+  pull_request:
+    paths:
+      - "delivery/gitlab-ci-terraform/**"
+      - ".github/workflows/gitlab-ci-terraform.yml"
+  push:
+    branches: [main]
+    paths:
+      - "delivery/gitlab-ci-terraform/**"
+      - ".github/workflows/gitlab-ci-terraform.yml"
+  schedule:
+    - cron: "43 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.16.4"
+          terraform_wrapper: false
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.5.0
+        with:
+          dockerfile: delivery/gitlab-ci-terraform/app/Dockerfile
+
+      # Copies the module out of the repo so a hidden dependency on the root
+      # shows up as a failure, then runs the full suite in the copy.
+      - name: copy-test (make test in a copy of the module)
+        run: |
+          dest="$RUNNER_TEMP/gitlab-ci-terraform"
+          cp -r delivery/gitlab-ci-terraform "$dest"
+          make -C "$dest" test

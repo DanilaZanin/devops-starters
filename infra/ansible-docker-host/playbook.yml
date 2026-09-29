@@ -1,9 +1,8 @@
 ---
-- name: bootstrap docker host
+- name: Bootstrap docker host
   hosts: docker_hosts
   become: true
   roles:
     - role: docker_bootstrap
       vars:
-        docker_bootstrap_users:
-          - "{{ ansible_user }}"
+        docker_bootstrap_users: "{{ [ansible_user] if ansible_user is defined else [] }}"

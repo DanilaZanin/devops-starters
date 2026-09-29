@@ -1,13 +1,18 @@
+# Production is pinned to a git tag and synced by hand. Promote by tagging a
+# commit that was already running in staging, changing targetRevision below in
+# a reviewed commit, then pressing Sync.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: demo-app-production
   namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
 spec:
-  project: default
+  project: demo-app
   source:
-    repoURL: https://github.com/YOUR_USERNAME/gitops-helm-argocd-starter.git
-    targetRevision: main
+    repoURL: https://github.com/YOUR_ORG/YOUR_REPO.git
+    targetRevision: v0.2.0
     path: charts/demo-app
     helm:
       valueFiles:
@@ -15,12 +20,13 @@ spec:
   destination:
     server: https://kubernetes.default.svc
     namespace: demo-app-production
+  # The HPA owns the replica count; do not report drift on it.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas
   syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
     syncOptions:
       - CreateNamespace=true
-  # Production doesn't self-heal into an unreviewed state without a human
-  # noticing — leave selfHeal on (drift gets reverted) but this is the file
-  # you'd flip to a manual sync policy if your org wants a gate before prod.
+      - RespectIgnoreDifferences=true

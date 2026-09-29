@@ -1,0 +1,4 @@
+---
+# Same trap check as the fixed scenario. Here it is expected to FAIL.
+- name: Verify the sshd trap is avoided
+  ansible.builtin.import_playbook: ../shared/verify_sshd.yml

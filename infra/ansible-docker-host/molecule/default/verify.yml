@@ -1,0 +1,46 @@
+---
+- name: Verify the sshd trap is avoided
+  ansible.builtin.import_playbook: ../shared/verify_sshd.yml
+
+- name: Verify the rest of the role
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Read the effective sshd configuration
+      ansible.builtin.command: /usr/sbin/sshd -T
+      register: sshd_effective
+      changed_when: false
+
+    - name: Root login and port are hardened too
+      ansible.builtin.assert:
+        that:
+          - "'permitrootlogin no' in sshd_effective.stdout_lines"
+          - "'port 22' in sshd_effective.stdout_lines"
+        quiet: true
+
+    - name: Check the docker client is installed
+      ansible.builtin.command: docker --version
+      changed_when: false
+
+    - name: Read ufw status
+      ansible.builtin.command: ufw status verbose
+      register: ufw_status
+      changed_when: false
+
+    - name: The ssh port is open and default incoming is deny
+      ansible.builtin.assert:
+        that:
+          - "'Status: active' in ufw_status.stdout"
+          - "'deny (incoming)' in ufw_status.stdout"
+          - "'22/tcp' in ufw_status.stdout"
+        quiet: true
+
+    - name: Node_exporter answers on loopback
+      ansible.builtin.uri:
+        url: http://127.0.0.1:9100/metrics
+        return_content: false
+        status_code: 200
+      retries: 5
+      delay: 2
+      register: ne_result
+      until: ne_result.status == 200

@@ -1,30 +1,63 @@
 ---
-# Deliberately using lineinfile instead of a full sshd_config template —
-# this way the role only touches the specific directives it cares about
-# and leaves the rest of whatever config the base image/distro shipped alone.
+# sshd uses the FIRST value it reads for most keywords, and Ubuntu's
+# /etc/ssh/sshd_config starts with `Include /etc/ssh/sshd_config.d/*.conf`.
+# Cloud images ship /etc/ssh/sshd_config.d/50-cloud-init.conf with
+# `PasswordAuthentication yes`, so editing sshd_config itself does nothing.
+# Files in the directory are read in lexical order: 00-hardening.conf wins.
 
-- name: disable password authentication
-  lineinfile:
-    path: /etc/ssh/sshd_config
-    regexp: "^#?PasswordAuthentication"
-    line: "PasswordAuthentication no"
-    validate: "sshd -t -f %s"
-  when: ssh_disable_password_auth
-  notify: restart sshd
+- name: Check whether ssh.socket activation is enabled (Ubuntu 24.04)
+  ansible.builtin.stat:
+    path: /etc/systemd/system/sockets.target.wants/ssh.socket
+  register: docker_bootstrap_ssh_socket
 
-- name: disable root login
-  lineinfile:
-    path: /etc/ssh/sshd_config
-    regexp: "^#?PermitRootLogin"
-    line: "PermitRootLogin no"
-    validate: "sshd -t -f %s"
-  when: ssh_disable_root_login
-  notify: restart sshd
+- name: Refuse a non-default ssh port when ssh.socket would ignore it
+  ansible.builtin.assert:
+    that:
+      - docker_bootstrap_ssh_port | int == 22 or not docker_bootstrap_ssh_socket.stat.exists
+    fail_msg: >-
+      ssh.socket is enabled, so systemd (not sshd_config) decides which port sshd listens on
+      and docker_bootstrap_ssh_port={{ docker_bootstrap_ssh_port }} would be ignored while ufw
+      opened it. Disable socket activation first (systemctl disable --now ssh.socket; systemctl
+      enable --now ssh.service) or keep the port at 22.
+    quiet: true
 
-- name: set ssh port
-  lineinfile:
-    path: /etc/ssh/sshd_config
-    regexp: "^#?Port"
-    line: "Port {{ ssh_port }}"
-    validate: "sshd -t -f %s"
-  notify: restart sshd
+- name: Create the sshd privilege separation directory (sshd -t needs it)
+  ansible.builtin.file:
+    path: /run/sshd
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the hardening drop-in
+  ansible.builtin.template:
+    src: sshd_hardening.conf.j2
+    dest: "/etc/ssh/sshd_config.d/{{ docker_bootstrap_ssh_dropin_name }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: /usr/sbin/sshd -t -f %s
+  notify: Restart sshd
+
+# Do not trust the file: ask sshd what it will actually use.
+- name: Read the effective sshd configuration
+  ansible.builtin.command: /usr/sbin/sshd -T
+  register: docker_bootstrap_sshd_effective
+  changed_when: false
+  check_mode: false
+
+- name: Check the effective sshd configuration
+  ansible.builtin.assert:
+    that:
+      - >-
+        not (docker_bootstrap_ssh_disable_password_auth | bool)
+        or 'passwordauthentication no' in docker_bootstrap_sshd_effective.stdout_lines
+      - >-
+        not (docker_bootstrap_ssh_disable_root_login | bool)
+        or 'permitrootlogin no' in docker_bootstrap_sshd_effective.stdout_lines
+      - ('port ' ~ docker_bootstrap_ssh_port) in docker_bootstrap_sshd_effective.stdout_lines
+    fail_msg: >-
+      sshd -T does not show the hardened values. Another file (or an earlier
+      Include) overrides {{ docker_bootstrap_ssh_dropin_name }}; inspect
+      /etc/ssh/sshd_config.d/ and the top of /etc/ssh/sshd_config.
+    quiet: true

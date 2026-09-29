@@ -1,20 +1,29 @@
 ---
-- name: gather minimal facts if not already present
-  setup:
-    gather_subset:
-      - "!all"
-      - "distribution"
-      - "architecture"
-  when: ansible_distribution is not defined
+- name: Refuse to run on unsupported systems
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['distribution'] == 'Ubuntu'
+      - ansible_facts['distribution_version'] in ['22.04', '24.04']
+      - ansible_facts['architecture'] in docker_bootstrap_arch_map
+    fail_msg: >-
+      docker_bootstrap supports Ubuntu 22.04/24.04 on x86_64 and aarch64 only
+      (got {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}
+      on {{ ansible_facts['architecture'] }}).
+    quiet: true
+  tags: [always]
 
-- import_tasks: docker.yml
+- name: Install Docker Engine
+  ansible.builtin.import_tasks: docker.yml
   tags: [docker]
 
-- import_tasks: node_exporter.yml
+- name: Install node_exporter
+  ansible.builtin.import_tasks: node_exporter.yml
   tags: [monitoring]
 
-- import_tasks: firewall.yml
+- name: Configure the firewall
+  ansible.builtin.import_tasks: firewall.yml
   tags: [firewall]
 
-- import_tasks: ssh_hardening.yml
+- name: Harden sshd
+  ansible.builtin.import_tasks: ssh_hardening.yml
   tags: [ssh]

@@ -1,0 +1,20 @@
+---
+# The trap check, shared by the "default" (fixed) and "broken" scenarios.
+# Asks sshd itself which value wins; does not grep config files.
+- name: Verify effective sshd configuration
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Read the effective sshd configuration
+      ansible.builtin.command: /usr/sbin/sshd -T
+      register: sshd_effective
+      changed_when: false
+
+    - name: Password authentication must be off in the effective config
+      ansible.builtin.assert:
+        that:
+          - "'passwordauthentication no' in sshd_effective.stdout_lines"
+        fail_msg: >-
+          SSHD_TRAP_TRIGGERED: sshd -T reports password authentication is still enabled;
+          an earlier file in /etc/ssh/sshd_config.d overrides the hardening.
+        quiet: true

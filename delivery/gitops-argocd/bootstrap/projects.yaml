@@ -1,0 +1,38 @@
+# Apply once, by hand, before bootstrap/root.yaml: `kubectl apply -f bootstrap/projects.yaml`.
+# Two AppProjects instead of `default`, which allows every repo, cluster and kind.
+#
+# gitops-root: may only create Application objects in the argocd namespace.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: gitops-root
+  namespace: argocd
+spec:
+  description: App-of-apps root. Creates Application objects only.
+  sourceRepos:
+    - https://github.com/YOUR_ORG/YOUR_REPO.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: argocd
+  clusterResourceWhitelist: []
+  namespaceResourceWhitelist:
+    - group: argoproj.io
+      kind: Application
+---
+# demo-app: the workloads. One repo, only demo-app-* namespaces on this cluster.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: demo-app
+  namespace: argocd
+spec:
+  description: demo-app staging and production.
+  sourceRepos:
+    - https://github.com/YOUR_ORG/YOUR_REPO.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: demo-app-*
+  # Needed for the CreateNamespace=true sync option.
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace

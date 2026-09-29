@@ -1,0 +1,25 @@
+# Systemd-enabled Ubuntu target for molecule. Rendered by the molecule docker
+# driver: item.image names the built image (ubuntu:22.04 / ubuntu:24.04). BASE is
+# the digest-pinned reference passed as a build arg.
+ARG BASE
+FROM ${BASE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    container=docker
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        dbus \
+        iproute2 \
+        openssh-server \
+        python3 \
+        python3-apt \
+        sudo \
+        systemd \
+        systemd-sysv \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /run/sshd
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

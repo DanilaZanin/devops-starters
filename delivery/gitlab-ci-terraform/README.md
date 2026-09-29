@@ -1,109 +1,122 @@
-# gitlab-ci-terraform-template
+# GitLab CI Terraform pipeline: plan in merge requests, apply on main, remote state
 
-A reusable `.gitlab-ci.yml` template: lint → test → build → Terraform
-plan/apply, split across staging (auto-applied) and production (manual gate),
-wired up against a small demo Python app and a demo Terraform config so the
-whole pipeline is actually runnable, not just a YAML sketch.
+Level: **lab** (static checks and trap tests run in CI; the pipeline itself is not executed).
 
-## Pipeline shape
+A `.gitlab-ci.yml` template: lint, test, build and push an image to the project
+registry, `terraform plan` in merge requests and on the default branch, and
+`terraform apply` on the default branch only (staging automatic, production behind a
+manual gate). The demo Terraform and app are small so the whole flow has something
+real to run.
 
-```
-lint -> test -> build -> terraform-plan:staging    -> terraform-apply:staging     (auto)
-                       -> terraform-plan:production -> terraform-apply:production  (manual)
-```
+## Problem
 
-- **lint / test** — `ruff` + `pytest` against `app/`
-- **build** — `docker build` via docker-in-docker (`docker:27-dind` service)
-- **terraform-plan / terraform-apply** — one pair per environment; plan
-  produces a `.tfplan` artifact, apply consumes exactly that artifact (not
-  a fresh plan) so what gets applied is provably what was reviewed
-- **production apply is `when: manual`** — staging ships on every push to
-  main, production needs a human to click it in the GitLab UI
+Terraform pipelines fail or misbehave in a few repeatable ways. A job using the
+`hashicorp/terraform` image dies at once with an error like `Terraform has no
+command named "sh"`: that image's ENTRYPOINT is the `terraform` binary, so GitLab's
+shell-wrapped script becomes arguments to terraform. Separately, on ephemeral
+runners a pipeline without remote state starts from empty state every time, so
+`apply` tries to recreate what already exists. And a pipeline whose `apply` job runs
+in merge requests can change real infrastructure from an unmerged branch.
 
-## Structure
+This template resets the entrypoint, keeps state in GitLab-managed Terraform state
+(one state per environment), and restricts applies to the default branch with a
+`resource_group` per environment.
 
-```
-.gitlab-ci.yml
-app/
-  app.py             # tiny demo module (add, is_palindrome)
-  Dockerfile
-  requirements.txt
-tests/
-  test_app.py
-terraform/
-  main.tf              # demo infra (docker provider, so plan/apply run without cloud creds)
+## Quick start
+
+```bash
+make check-prereqs   # python3, terraform
+make test            # ruff, app tests, trap tests, terraform fmt/validate
 ```
 
-`terraform/main.tf` uses the Docker provider instead of AWS/GCP so the
-`terraform-plan` / `terraform-apply` jobs are actually runnable without any
-cloud credentials — swap the provider block for your real one; the pipeline
-logic (plan-as-artifact, environment-gated apply) doesn't change.
+`make test` creates `.venv` from `requirements-dev.txt`, runs `ruff` and
+`terraform fmt -check`, then `pytest` (the app tests and `tests/test_traps.py`),
+and ends with `terraform validate` (`init -backend=false`, which downloads the
+docker provider). The trap tests fail if any broken variant passes.
 
-## Two real gotchas fixed while building this, not hidden
+`make up` builds the demo image and serves it on `127.0.0.1:8080`;
+`make down` stops it; `make reset` removes `.venv`, caches and `terraform/.terraform`;
+`make lock` regenerates the provider lock file (needs network).
 
-1. **`build` job couldn't reach the dind service.** The classic
-   `docker:27` + `docker:27-dind` service pattern needs
-   `DOCKER_HOST: tcp://docker:2375` and `DOCKER_TLS_CERTDIR: ""` set
-   explicitly — without them the client tries to talk TLS on a plaintext
-   port and fails with `Cannot connect to the Docker daemon`.
+| | Status |
+|---|---|
+| macOS arm64 + colima (4 CPU / 8 GB) | verified 2026-09-29: `make test` green, also from a copied directory; `make up` served `/health`. Terraform 1.16.4, kreuzwerker/docker 4.6.0, pytest 9.1.1, ruff 0.16.9, Python 3.14; `hadolint` and `trivy config` (0.74.0, run via its image, HIGH/CRITICAL) report nothing |
+| ubuntu-24.04 GitHub runner | CI only, not measured here; see `.github/workflows/gitlab-ci-terraform.yml` |
+| First-run time | about 21 s for the first `make test` (venv install and provider download); about 12 s from a copied directory with the provider cached |
+| RAM | `make test` starts no containers; the demo container idles at a few tens of MB (not measured precisely) |
 
-2. **`hashicorp/terraform` image swallows shell scripts.** That image sets
-   `ENTRYPOINT` to the `terraform` binary itself, so a normal multi-line
-   CI `script:` block (which GitLab wraps in `sh -c "..."`) gets run as
-   `terraform sh -c "..."` instead — fails immediately with
-   `Terraform has no command named "sh"`. Fixed with
-   `image: {name: hashicorp/terraform:1.10, entrypoint: [""]}`.
 
-## Verified — ran every stage for real, not just YAML-linted
+## Traps this avoids
 
-Used [`gitlab-ci-local`](https://github.com/firecow/gitlab-ci-local), which
-executes a real `.gitlab-ci.yml` against Docker exactly like GitLab Runner
-would, without needing an actual GitLab server:
+1. **Terraform image ENTRYPOINT swallows the job script** (reproduced in tests).
+   `.terraform` sets `entrypoint: [""]`; the same applies to the trivy job.
+2. **State on the runner.** `terraform/backend.tf` uses `backend "http" {}` and
+   `.gitlab-ci.yml` points it at GitLab-managed state through `TF_HTTP_*`
+   variables, with locking. Reproduced in tests as a policy check (backend
+   declared, state address set), not by running Terraform against GitLab.
+3. **Apply from a merge request.** Apply jobs have rules for the default branch only.
+   Plans run in both. Production apply is `when: manual` with `allow_failure: false`.
+4. **Concurrent applies.** `resource_group` per environment.
+5. **Provider drift.** `.terraform.lock.hcl` is committed (not git-ignored) and CI runs
+   `terraform init -lockfile=readonly`.
+
+Also: the image is built with a non-root user and a real `CMD`, and pushed to
+`$CI_REGISTRY_IMAGE` from the default branch; lint stages run `terraform fmt`,
+`validate` and `trivy config`.
+
+## What the test proves / does NOT prove
+
+Proves:
+
+- The shipped `.gitlab-ci.yml` (with `extends` resolved the way GitLab merges it)
+  satisfies the policy in `checks/pipeline_policy.py`, and each mutation in
+  `tests/test_traps.py` (drop the entrypoint reset, allow apply in merge requests, remove
+  the production gate, drop the resource group, drop the push, drop the readonly
+  lock, drop the remote backend, git-ignore or delete the lock file, run the image as
+  root, remove the CMD) is reported with the expected code.
+- `terraform fmt -check` and `terraform validate` pass; the app tests pass.
+
+Does NOT prove:
+
+- That GitLab accepts or runs the pipeline. Nothing here executes a GitLab job or
+  lints the file with GitLab's own CI lint. Paste it into the project's CI Lint page
+  or use `gitlab-ci-local` (a third-party tool, not part of this module) before
+  relying on it.
+- That state locking, the job token and the state API work. That needs a GitLab project.
+- That the trivy job passes inside GitLab. The same `trivy config` calls were run locally through the trivy image and were clean. The pinned job images (`hashicorp/terraform:1.16.4`, `docker:29`, `docker:29-dind`, `aquasec/trivy:0.74.0`, `python:3.14-slim`) were checked to exist with `docker manifest inspect`, but no job was run.
+- That `apply` succeeds. The demo target is a container on the job's own docker-in-docker
+  daemon, so it vanishes when the job ends while the state remembers it.
+
+## Local demo vs production
+
+- Replace the docker provider and `docker_container` with your real provider. Then
+  run `make lock` (or `terraform providers lock ...`) and commit the new lock file.
+- Docker-in-docker needs a runner with privileged mode. Prefer a runner with a
+  dedicated Docker host or Kaniko/BuildKit for image builds.
+- Protect production: protected branches, a protected `production` environment with
+  required approvals, and restricted access to the state (Settings, CI/CD, job token
+  allowlist).
+- Plan files can contain secrets; artifacts expire after one day, restrict who can
+  download them.
+- Add real credentials as masked, protected CI/CD variables, never in the repo.
+- Pin images by digest and let Renovate bump them: `hashicorp/terraform`,
+  `docker`, `aquasec/trivy`, `python`.
+
+## Copy it into your project
+
+Copy `.gitlab-ci.yml`, `terraform/`, `app/` and, if you want the regression tests,
+`checks/`, `tests/test_traps.py`, `pytest.ini`, `ruff.toml`, `requirements-dev.txt`
+and the `Makefile`. Adjust the policy in `checks/pipeline_policy.py` when you
+rename jobs (it expects `plan:<env>`, `apply:<env>`, `build`). No reference points
+outside this directory.
+
+## Layout
 
 ```
-$ gitlab-ci-local lint test
- PASS  lint
- PASS  test          # 2 passed in 0.02s (real pytest run)
-
-$ gitlab-ci-local build --privileged
- PASS  build          # real `docker build` inside the dind service,
-                       # image tagged local-registry.../fallback.project:<sha>
-
-$ gitlab-ci-local terraform-plan:staging --volume /var/run/docker.sock:/var/run/docker.sock
- PASS  terraform-plan:staging
-       Plan: 2 to add, 0 to change, 0 to destroy
-       Saved the plan to: staging.tfplan
-
-$ gitlab-ci-local terraform-apply:staging --volume /var/run/docker.sock:/var/run/docker.sock
- PASS  terraform-apply:staging
-       docker_container.app: Creation complete after 1s [id=5081896e...]
-
-$ docker ps --filter name=gitlab-ci-demo
-CONTAINER ID   IMAGE      STATUS         NAMES
-5081896e22be   65645c7b   Up 6 seconds   gitlab-ci-demo-staging
+.gitlab-ci.yml                pipeline
+app/                          demo service (stdlib HTTP server) and its Dockerfile
+terraform/                    backend.tf (http state), versions.tf, main.tf, lock file
+checks/pipeline_policy.py     the policy the pipeline must satisfy
+tests/test_traps.py           broken pipelines must fail the policy
+tests/test_app.py             app tests
 ```
-
-The container terraform said it would create is actually running on the
-host — the apply job genuinely executed `terraform apply` against the exact
-plan artifact the previous job produced, same as a real GitLab pipeline
-passing `staging.tfplan` between stages.
-
-```
-$ gitlab-ci-local --list | grep production
-terraform-apply:production   terraform-apply  manual  true  production  [terraform-plan:production]
-```
-
-`when: manual, allow_failure: true` confirmed on the production apply job —
-it will not run on its own in a real pipeline, matching the intent that
-production needs a human in the loop.
-
-(Note on `--volume .../docker.sock` for the terraform jobs: a real GitLab
-Runner would either use a `dind` service like the build job, or a runner
-with Docker executor access to a real Docker host. Mounting the local
-socket was the simplest way to give the containerized `terraform-plan` /
-`terraform-apply` jobs something real to talk to for this local
-verification — documented here rather than left unexplained.)
-
-Stack: GitLab CI syntax (validated + executed via `gitlab-ci-local` 4.73),
-Terraform 1.10 (Docker provider), Python 3.12 (`ruff`, `pytest`), Docker
-27 + dind, tested on Ubuntu 22.04.

@@ -1,10 +1,10 @@
 ---
 # Installs Docker Engine from the official repo, not the (usually stale)
-# distro package. Mirrors what get.docker.com does but idempotently and
-# without piping curl to sh in prod.
+# distro package, and refuses to trust the repo key unless its fingerprint
+# matches docker_bootstrap_gpg_fingerprint.
 
-- name: install prerequisite packages
-  apt:
+- name: Install prerequisite packages
+  ansible.builtin.apt:
     name:
       - ca-certificates
       - curl
@@ -13,53 +13,80 @@
     update_cache: true
     cache_valid_time: 3600
 
-- name: create keyrings dir
-  file:
+- name: Create keyrings dir
+  ansible.builtin.file:
     path: /etc/apt/keyrings
     state: directory
+    owner: root
+    group: root
     mode: "0755"
 
-- name: check if docker gpg key already present
-  stat:
-    path: /etc/apt/keyrings/docker.asc
-  register: docker_gpg_key
+- name: Download and verify the Docker apt key
+  block:
+    - name: Download docker gpg key
+      ansible.builtin.get_url:
+        url: "{{ docker_bootstrap_gpg_key_url }}"
+        dest: /etc/apt/keyrings/docker.asc
+        owner: root
+        group: root
+        mode: "0644"
 
-- name: download docker gpg key
-  get_url:
-    url: https://download.docker.com/linux/ubuntu/gpg
-    dest: /etc/apt/keyrings/docker.asc
-    mode: "0644"
-  when: not docker_gpg_key.stat.exists
+    - name: Read the fingerprint of the downloaded key
+      ansible.builtin.command: gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc
+      register: docker_bootstrap_gpg_keys
+      changed_when: false
+      check_mode: false
 
-- name: add docker apt repository
-  apt_repository:
+    - name: Check the key fingerprint
+      ansible.builtin.assert:
+        that:
+          - >-
+            ('fpr:::::::::' ~ docker_bootstrap_gpg_fingerprint ~ ':')
+            in docker_bootstrap_gpg_keys.stdout_lines
+        fail_msg: >-
+          /etc/apt/keyrings/docker.asc does not contain the expected fingerprint
+          {{ docker_bootstrap_gpg_fingerprint }}. Refusing to add the Docker repository.
+        quiet: true
+  rescue:
+    - name: Remove the untrusted key
+      ansible.builtin.file:
+        path: /etc/apt/keyrings/docker.asc
+        state: absent
+
+    - name: Stop because the Docker key could not be verified
+      ansible.builtin.fail:
+        msg: >-
+          Docker apt key verification failed; the key file was removed and the
+          Docker repository was not added.
+
+- name: Add docker apt repository
+  ansible.builtin.apt_repository:
     repo: >-
-      deb [arch={{ ansible_architecture == 'x86_64' and 'amd64' or ansible_architecture }}
+      deb [arch={{ docker_bootstrap_arch_map[ansible_facts['architecture']] }}
       signed-by=/etc/apt/keyrings/docker.asc]
-      https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+      https://download.docker.com/linux/ubuntu {{ ansible_facts['distribution_release'] }} stable
     filename: docker
     state: present
 
-- name: install docker engine
-  apt:
+- name: Install docker engine
+  ansible.builtin.apt:
     name:
       - docker-ce
       - docker-ce-cli
       - containerd.io
       - docker-compose-plugin
     state: present
-    update_cache: true
+    cache_valid_time: 3600
 
-- name: make sure docker is enabled and running
-  systemd:
+- name: Make sure docker is enabled and running
+  ansible.builtin.systemd_service:
     name: docker
     enabled: true
     state: started
 
-- name: add users to the docker group
-  user:
+- name: Add users to the docker group
+  ansible.builtin.user:
     name: "{{ item }}"
     groups: docker
     append: true
   loop: "{{ docker_bootstrap_users }}"
-  when: docker_bootstrap_users | length > 0

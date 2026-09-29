@@ -1,0 +1,52 @@
+name: vault-agent-injection
+
+on:
+  pull_request:
+    paths:
+      - "delivery/vault-agent-injection/**"
+      - ".github/workflows/vault-agent-injection.yml"
+  push:
+    branches: [main]
+    paths:
+      - "delivery/vault-agent-injection/**"
+      - ".github/workflows/vault-agent-injection.yml"
+  schedule:
+    - cron: "37 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # kind, kubectl and helm are preinstalled on GitHub's ubuntu runners.
+      - name: Show tool versions
+        run: |
+          docker version --format '{{.Server.Version}}'
+          kind version
+          kubectl version --client
+          helm version --short
+
+      - name: Static checks (shellcheck)
+        run: shellcheck delivery/vault-agent-injection/scripts/e2e.sh
+
+      # Copies the module out of the repo so a hidden dependency on the root
+      # shows up as a failure, then runs the e2e test in the copy.
+      - name: copy-test (make test in a copy of the module)
+        run: |
+          dest="$RUNNER_TEMP/vault-agent-injection"
+          cp -r delivery/vault-agent-injection "$dest"
+          make -C "$dest" test
+
+      - name: Clean up kind cluster
+        if: always()
+        run: make -C "$RUNNER_TEMP/vault-agent-injection" down || true

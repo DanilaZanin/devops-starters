@@ -1,55 +1,78 @@
 ---
-- name: create node_exporter system user (no shell, no home)
-  user:
+- name: Create node_exporter system user (no shell, no home)
+  ansible.builtin.user:
     name: node_exporter
     system: true
     shell: /usr/sbin/nologin
     create_home: false
 
-- name: check current installed version, if any
-  command: /usr/local/bin/node_exporter --version
-  register: node_exporter_current
+- name: Check current installed version, if any
+  ansible.builtin.command: /usr/local/bin/node_exporter --version
+  register: docker_bootstrap_ne_current
   changed_when: false
   failed_when: false
+  check_mode: false
 
-- name: download and install node_exporter
-  when: >
-    node_exporter_current.rc is undefined or
-    node_exporter_current.rc != 0 or
-    node_exporter_version not in (node_exporter_current.stderr | default(''))
+- name: Download, verify and install node_exporter
+  when: >-
+    docker_bootstrap_ne_current.rc != 0 or
+    ('version ' ~ docker_bootstrap_node_exporter_version ~ ' ') not in
+    ((docker_bootstrap_ne_current.stdout | default('')) ~ (docker_bootstrap_ne_current.stderr | default('')))
+  vars:
+    docker_bootstrap_ne_arch: "{{ docker_bootstrap_arch_map[ansible_facts['architecture']] }}"
+    docker_bootstrap_ne_dirname: "node_exporter-{{ docker_bootstrap_node_exporter_version }}.linux-{{ docker_bootstrap_ne_arch }}"
+    docker_bootstrap_ne_base_url: "https://github.com/prometheus/node_exporter/releases/download/v{{ docker_bootstrap_node_exporter_version }}"
   block:
-    - name: download node_exporter tarball
-      get_url:
-        url: "https://github.com/prometheus/node_exporter/releases/download/v{{ node_exporter_version }}/node_exporter-{{ node_exporter_version }}.linux-amd64.tar.gz"
-        dest: "/tmp/node_exporter-{{ node_exporter_version }}.tar.gz"
+    # The checksum comes from the upstream release's sha256sums.txt, so a
+    # truncated or tampered download fails here instead of being installed as root.
+    - name: Download node_exporter tarball (sha256 checked against the release's sha256sums.txt)
+      ansible.builtin.get_url:
+        url: "{{ docker_bootstrap_ne_base_url }}/{{ docker_bootstrap_ne_dirname }}.tar.gz"
+        dest: "/var/tmp/{{ docker_bootstrap_ne_dirname }}.tar.gz"
+        checksum: "sha256:{{ docker_bootstrap_ne_base_url }}/sha256sums.txt"
+        owner: root
+        group: root
         mode: "0644"
 
-    - name: extract node_exporter
-      unarchive:
-        src: "/tmp/node_exporter-{{ node_exporter_version }}.tar.gz"
-        dest: /tmp
+    - name: Extract node_exporter
+      ansible.builtin.unarchive:
+        src: "/var/tmp/{{ docker_bootstrap_ne_dirname }}.tar.gz"
+        dest: /var/tmp
         remote_src: true
 
-    - name: install node_exporter binary
-      copy:
-        src: "/tmp/node_exporter-{{ node_exporter_version }}.linux-amd64/node_exporter"
+    - name: Install node_exporter binary
+      ansible.builtin.copy:
+        src: "/var/tmp/{{ docker_bootstrap_ne_dirname }}/node_exporter"
         dest: /usr/local/bin/node_exporter
         mode: "0755"
         remote_src: true
         owner: root
         group: root
-      notify: restart node_exporter
+      notify: Restart node_exporter
 
-- name: install node_exporter systemd unit
-  template:
+    - name: Remove temporary download files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/var/tmp/{{ docker_bootstrap_ne_dirname }}.tar.gz"
+        - "/var/tmp/{{ docker_bootstrap_ne_dirname }}"
+
+- name: Install node_exporter systemd unit
+  ansible.builtin.template:
     src: node_exporter.service.j2
     dest: /etc/systemd/system/node_exporter.service
+    owner: root
+    group: root
     mode: "0644"
-  notify: restart node_exporter
+  notify: Restart node_exporter
 
-- name: enable and start node_exporter
-  systemd:
+# The unit file must be loaded before it can be enabled.
+- name: Apply pending node_exporter changes now
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start node_exporter
+  ansible.builtin.systemd_service:
     name: node_exporter
     enabled: true
     state: started
-    daemon_reload: true

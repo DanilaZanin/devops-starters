@@ -1,0 +1,20 @@
+---
+# Make the container look like a cloud image: cloud-init drops
+# /etc/ssh/sshd_config.d/50-cloud-init.conf with PasswordAuthentication yes.
+- name: Prepare
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Simulate the cloud-init sshd drop-in
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/50-cloud-init.conf
+        content: |
+          # Simulates the file cloud-init writes on cloud images.
+          PasswordAuthentication yes
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Check that sshd_config includes the drop-in directory
+      ansible.builtin.command: grep -Eq '^Include /etc/ssh/sshd_config.d/\*\.conf' /etc/ssh/sshd_config
+      changed_when: false

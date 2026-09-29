@@ -1,0 +1,53 @@
+name: ansible-docker-host
+
+on:
+  pull_request:
+    paths:
+      - "infra/ansible-docker-host/**"
+      - ".github/workflows/ansible-docker-host.yml"
+  push:
+    branches: [main]
+    paths:
+      - "infra/ansible-docker-host/**"
+      - ".github/workflows/ansible-docker-host.yml"
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: infra/ansible-docker-host/requirements-dev.txt
+
+      - name: Install test tooling
+        run: pip install -r infra/ansible-docker-host/requirements-dev.txt
+
+      - name: Show tool versions
+        run: |
+          ansible --version
+          molecule --version
+          ansible-lint --version
+          docker version
+
+      # Copies the module out of the repo so a hidden dependency on the root
+      # shows up as a failure, then runs the full suite in the copy.
+      - name: copy-test (make test in a copy of the module)
+        run: |
+          dest="$RUNNER_TEMP/ansible-docker-host"
+          cp -r infra/ansible-docker-host "$dest"
+          make -C "$dest" test

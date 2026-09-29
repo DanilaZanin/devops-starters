@@ -1,0 +1,6 @@
+# Test tooling, exact versions verified on macOS arm64 (2026-09-29).
+ansible-core==2.21.4
+ansible-lint==26.9.0
+molecule==26.9.0
+molecule-plugins[docker]==26.9.28
+docker==7.2.0

@@ -1,2 +1,5 @@
 *.retry
 inventory/hosts.ini
+.collections/
+.trap-broken.log
+.cache/
