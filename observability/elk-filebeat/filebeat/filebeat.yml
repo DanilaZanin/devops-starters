@@ -1,38 +1,38 @@
+# Opt-in log collection: only containers that carry the label
+#   co.elastic.logs/enabled: "true"
+# are shipped. Everything else on the host is left alone.
 filebeat.autodiscover:
   providers:
     - type: docker
-      # opt-in: only containers carrying this label get collected, so
-      # attaching this stack to an existing docker-compose project doesn't
-      # suddenly vacuum up every container's logs on the host - just add
-      # the label to the services you actually want shipped.
-      #
-      # (tried filebeat's hints.enabled + label mechanism first - it has a
-      # version-specific bug where the *implicit* per-container template
-      # fails to resolve "data.container.id" and silently drops the input,
-      # and worse, once you work around that with hints.default_config, that
-      # default gets applied to every container regardless of the label,
-      # defeating the whole point. `templates` + `condition` below is the
-      # documented, reliable way to do conditional collection.)
-      templates:
-        - condition:
-            equals:
-              docker.container.labels.enable_logging: "true"
-          config:
-            - type: container
-              paths:
-                - "/var/lib/docker/containers/${data.container.id}/*.log"
+      hints.enabled: true
+      hints.default_config:
+        # This line is what makes collection opt-in. Without it, default_config is
+        # applied to EVERY container (Elasticsearch, Kibana, Filebeat itself, and
+        # anything else on the host), and the label changes nothing.
+        enabled: false
+        type: filestream
+        # Filestream needs a unique id per input. The `container` input of older
+        # Filebeat versions is gone in 9.x.
+        id: container-${data.container.id}
+        parsers:
+          - container: ~
+        paths:
+          - /var/lib/docker/containers/${data.container.id}/*.log
 
 processors:
   - add_docker_metadata: ~
 
-output.elasticsearch:
-  hosts: ["http://elasticsearch:9200"]
-  index: "app-logs-%{+yyyy.MM.dd}"
-
+# The index template and the ILM policy are created by the `setup` service, so
+# Filebeat only needs permission to write documents.
+setup.ilm.enabled: false
+setup.template.enabled: false
 setup.template.name: "app-logs"
 setup.template.pattern: "app-logs-*"
-setup.ilm.enabled: false
 
-logging.level: debug
-logging.selectors: ["autodiscover"]
-logging.to_stderr: true
+output.elasticsearch:
+  hosts: ["http://elasticsearch:9200"]
+  username: filebeat_writer
+  password: "${FILEBEAT_PASSWORD}"
+  index: "app-logs-%{+yyyy.MM.dd}"
+
+logging.level: info

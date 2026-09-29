@@ -1,66 +1,122 @@
+name: kafka-spark-pipeline
+
 services:
   kafka:
-    image: apache/kafka:3.8.0
-    container_name: kafka
+    image: apache/kafka:4.3.1
+    hostname: kafka
     ports:
-      - "9092:9092"
+      # Only the host-facing listener is published, and only on loopback.
+      - "127.0.0.1:29092:29092"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      # INTERNAL is what other containers use, EXTERNAL is what a client on the host uses.
+      # Each name must resolve from the place the client runs.
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created explicitly by kafka-init: a typo in a topic name
+      # should fail loudly, not create a new empty topic.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 || exit 1"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
       interval: 10s
       timeout: 10s
-      retries: 10
+      retries: 12
+      start_period: 20s
+
+  kafka-init:
+    image: apache/kafka:4.3.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    command:
+      - /opt/kafka/bin/kafka-topics.sh
+      - --bootstrap-server
+      - kafka:9092
+      - --create
+      - --if-not-exists
+      - --topic
+      - orders
+      - --partitions
+      - "3"
+      - --replication-factor
+      - "1"
 
   postgres:
-    image: postgres:16-alpine
-    container_name: pipeline-postgres
+    # Built, not bind-mounted: a bind mount from a path the Docker VM cannot see (a copy
+    # under macOS $TMPDIR with colima, a remote daemon) arrives empty and the schema is
+    # silently never created.
+    build: ./postgres-init
+    image: kafka-spark-pipeline-postgres:18.6-alpine
     environment:
-      POSTGRES_USER: pipeline
-      POSTGRES_PASSWORD: pipeline
-      POSTGRES_DB: analytics
+      POSTGRES_USER: ${POSTGRES_USER:-pipeline}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-analytics}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
-      - ./postgres-init:/docker-entrypoint-initdb.d
+      - postgres-data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U pipeline"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 10
 
   producer:
     build: ./producer
-    container_name: orders-producer
     depends_on:
-      kafka:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     environment:
       KAFKA_BOOTSTRAP: kafka:9092
       TOPIC: orders
-      EVENTS_PER_SEC: "5"
+      EVENTS_PER_SEC: ${EVENTS_PER_SEC:-5}
+    # SIGTERM makes the producer flush what is still in flight; give it time.
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, sys, time; p = '/tmp/alive'; sys.exit(0 if os.path.exists(p) and time.time() - os.path.getmtime(p) < 30 else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
 
   spark-job:
     build: ./spark-job
-    container_name: orders-spark-streaming
     depends_on:
-      kafka:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     environment:
       KAFKA_BOOTSTRAP: kafka:9092
       TOPIC: orders
+      CHECKPOINT_DIR: /checkpoints/orders
       PG_HOST: postgres
-      PG_DB: analytics
-      PG_USER: pipeline
-      PG_PASSWORD: pipeline
+      PG_DB: ${POSTGRES_DB:-analytics}
+      PG_USER: ${POSTGRES_USER:-pipeline}
+      PG_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - spark-checkpoints:/checkpoints
+    restart: unless-stopped
+
+volumes:
+  kafka-data:
+  postgres-data:
+  spark-checkpoints:

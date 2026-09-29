@@ -1,21 +1,52 @@
+name: rabbitmq-retry-dlq
+
 services:
   rabbitmq:
-    image: rabbitmq:3.13-management-alpine
-    container_name: taskqueue-rabbitmq
+    image: rabbitmq:4.3.6-management-alpine
+    # RabbitMQ keys its data directory by node name, which derives from the
+    # hostname. A fixed hostname keeps the queues when the container is recreated.
+    hostname: rabbitmq
+    environment:
+      # Setting these replaces the built-in guest/guest user instead of adding to it.
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?set RABBITMQ_USER in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      # check_port_connectivity tries the AMQP listener itself; `ping` only proves
+      # the Erlang node is up, which can be true a few seconds before AMQP accepts.
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
       interval: 5s
-      timeout: 5s
-      retries: 10
+      timeout: 10s
+      retries: 20
+      start_period: 20s
 
-  worker:
+  consumer:
     build: .
-    container_name: taskqueue-worker
     depends_on:
       rabbitmq:
         condition: service_healthy
     environment:
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_USER: ${RABBITMQ_USER:?set RABBITMQ_USER in .env}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}
+      MAX_RETRIES: ${MAX_RETRIES:-3}
+      RETRY_DELAY_MS: ${RETRY_DELAY_MS:-3000}
+      HEARTBEAT_FILE: /tmp/heartbeat
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, sys, time; p = '/tmp/heartbeat'; sys.exit(0 if os.path.exists(p) and time.time() - os.path.getmtime(p) < 30 else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  rabbitmq-data:

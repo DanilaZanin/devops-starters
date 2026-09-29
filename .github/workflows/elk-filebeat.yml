@@ -1,0 +1,55 @@
+name: elk-filebeat
+
+# lab level: every PR gets the static checks; the full smoke run (about ten minutes,
+# needs a few GB of RAM for Elasticsearch and Kibana) runs weekly and on demand.
+on:
+  pull_request:
+    paths:
+      - "observability/elk-filebeat/**"
+      - ".github/workflows/elk-filebeat.yml"
+  push:
+    branches: [main]
+    paths:
+      - "observability/elk-filebeat/**"
+      - ".github/workflows/elk-filebeat.yml"
+  schedule:
+    - cron: "37 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: elk-filebeat-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Copy the module out of the repository
+        run: cp -r observability/elk-filebeat "$RUNNER_TEMP/module"
+      - name: make lint (compose config, pinned images, loopback ports)
+        run: cd "$RUNNER_TEMP/module" && make lint
+
+  smoke:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: static
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Raise vm.max_map_count for Elasticsearch
+        run: sudo sysctl -w vm.max_map_count=262144
+      - name: Copy the module out of the repository
+        run: cp -r observability/elk-filebeat "$RUNNER_TEMP/module"
+      - name: make test (in the copy)
+        run: cd "$RUNNER_TEMP/module" && make test
+      - name: Container logs (on failure)
+        if: failure()
+        run: cd "$RUNNER_TEMP/module" && docker compose logs --no-color --tail 100
+      - name: make reset
+        if: always()
+        run: cd "$RUNNER_TEMP/module" && make reset

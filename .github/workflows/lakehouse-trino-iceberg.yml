@@ -1,0 +1,53 @@
+name: lakehouse-trino-iceberg
+
+# lab level: every PR gets the static checks; the full smoke run (including the
+# duplicate-load trap) runs weekly and on demand.
+on:
+  pull_request:
+    paths:
+      - "data/lakehouse-trino-iceberg/**"
+      - ".github/workflows/lakehouse-trino-iceberg.yml"
+  push:
+    branches: [main]
+    paths:
+      - "data/lakehouse-trino-iceberg/**"
+      - ".github/workflows/lakehouse-trino-iceberg.yml"
+  schedule:
+    - cron: "19 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lakehouse-trino-iceberg-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Copy the module out of the repository
+        run: cp -r data/lakehouse-trino-iceberg "$RUNNER_TEMP/module"
+      - name: make lint (compose config, pinned images, loopback ports)
+        run: cd "$RUNNER_TEMP/module" && make lint
+
+  smoke:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: static
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Copy the module out of the repository
+        run: cp -r data/lakehouse-trino-iceberg "$RUNNER_TEMP/module"
+      - name: make test (in the copy)
+        run: cd "$RUNNER_TEMP/module" && make test
+      - name: Container logs (on failure)
+        if: failure()
+        run: cd "$RUNNER_TEMP/module" && docker compose logs --no-color --tail 100
+      - name: make reset
+        if: always()
+        run: cd "$RUNNER_TEMP/module" && make reset
