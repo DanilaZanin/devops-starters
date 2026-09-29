@@ -1,0 +1,6 @@
+apiVersion: v2
+name: demo-app
+description: A minimal web app chart used to exercise the GitOps pipeline (nginx serving a static page, nothing fancier is needed to prove sync/rollback work).
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

@@ -1,0 +1,26 @@
+# The "app of apps" — point ArgoCD at this one Application and it will
+# discover and sync everything under apps/*.yaml itself. This is the only
+# thing you register manually; staging.yaml and production.yaml (and anything
+# else you drop in apps/) get picked up automatically.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/YOUR_USERNAME/gitops-helm-argocd-starter.git
+    targetRevision: main
+    path: apps
+    directory:
+      exclude: "root.yaml"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

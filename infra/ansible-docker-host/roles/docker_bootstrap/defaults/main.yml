@@ -1,0 +1,21 @@
+---
+# Users to add to the docker group so they can run docker without sudo.
+docker_bootstrap_users: []
+
+# node_exporter
+node_exporter_version: "1.8.2"
+node_exporter_port: 9100
+# Only these CIDRs get through the firewall to the exporter port.
+# Point this at your monitoring server/subnet, not 0.0.0.0/0.
+node_exporter_allowed_cidrs:
+  - "10.0.0.0/8"
+
+# ufw
+firewall_allowed_tcp_ports:
+  - 22
+firewall_enabled: true
+
+# SSH hardening
+ssh_disable_password_auth: true
+ssh_disable_root_login: true
+ssh_port: 22

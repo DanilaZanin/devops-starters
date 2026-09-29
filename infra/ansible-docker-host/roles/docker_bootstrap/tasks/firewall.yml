@@ -1,0 +1,35 @@
+---
+- name: install ufw
+  apt:
+    name: ufw
+    state: present
+
+- name: default deny incoming
+  community.general.ufw:
+    default: deny
+    direction: incoming
+
+- name: default allow outgoing
+  community.general.ufw:
+    default: allow
+    direction: outgoing
+
+- name: allow admin-facing tcp ports
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+  loop: "{{ firewall_allowed_tcp_ports }}"
+
+- name: allow node_exporter only from the monitoring CIDRs
+  community.general.ufw:
+    rule: allow
+    port: "{{ node_exporter_port }}"
+    proto: tcp
+    src: "{{ item }}"
+  loop: "{{ node_exporter_allowed_cidrs }}"
+
+- name: enable ufw
+  community.general.ufw:
+    state: enabled
+  when: firewall_enabled

@@ -1,0 +1,12 @@
+replicaCount: 1
+
+env:
+  APP_ENV: "staging"
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    cpu: 100m
+    memory: 64Mi

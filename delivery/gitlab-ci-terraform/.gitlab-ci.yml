@@ -1,0 +1,109 @@
+stages:
+  - lint
+  - test
+  - build
+  - terraform-plan
+  - terraform-apply
+
+variables:
+  TF_ROOT: ${CI_PROJECT_DIR}/terraform
+  IMAGE_TAG: ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}
+
+.python_base:
+  image: python:3.12-slim
+  before_script:
+    - pip install --quiet -r app/requirements.txt
+
+lint:
+  extends: .python_base
+  stage: lint
+  script:
+    - ruff check app/ tests/
+
+test:
+  extends: .python_base
+  stage: test
+  script:
+    - pytest tests/ -v --junitxml=report.xml
+  artifacts:
+    when: always
+    reports:
+      junit: report.xml
+
+build:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - docker build -t "$IMAGE_TAG" app/
+    # would `docker push` here against a real registry; left as a comment
+    # since this template doesn't assume you have one configured:
+    # - docker push "$IMAGE_TAG"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+.terraform_base:
+  # the hashicorp/terraform image sets ENTRYPOINT to the terraform binary
+  # itself, so plain `image: hashicorp/terraform:1.10` makes every job
+  # command run as `terraform <script line>` instead of a shell - has to be
+  # overridden to actually run multi-line scripts.
+  image:
+    name: hashicorp/terraform:1.10
+    entrypoint: [""]
+  before_script:
+    - cd "$TF_ROOT"
+    - terraform init -input=false
+
+terraform-plan:staging:
+  extends: .terraform_base
+  stage: terraform-plan
+  script:
+    - terraform plan -input=false -var="environment=staging" -out=staging.tfplan
+  artifacts:
+    paths:
+      - terraform/staging.tfplan
+    expire_in: 1 hour
+  environment:
+    name: staging
+
+terraform-apply:staging:
+  extends: .terraform_base
+  stage: terraform-apply
+  needs: ["terraform-plan:staging"]
+  script:
+    - terraform apply -input=false staging.tfplan
+  environment:
+    name: staging
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+terraform-plan:production:
+  extends: .terraform_base
+  stage: terraform-plan
+  script:
+    - terraform plan -input=false -var="environment=production" -out=production.tfplan
+  artifacts:
+    paths:
+      - terraform/production.tfplan
+    expire_in: 1 hour
+  environment:
+    name: production
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+terraform-apply:production:
+  extends: .terraform_base
+  stage: terraform-apply
+  needs: ["terraform-plan:production"]
+  script:
+    - terraform apply -input=false production.tfplan
+  environment:
+    name: production
+  # production never applies automatically - someone has to click it
+  when: manual
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

@@ -1,0 +1,65 @@
+---
+# Installs Docker Engine from the official repo, not the (usually stale)
+# distro package. Mirrors what get.docker.com does but idempotently and
+# without piping curl to sh in prod.
+
+- name: install prerequisite packages
+  apt:
+    name:
+      - ca-certificates
+      - curl
+      - gnupg
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: create keyrings dir
+  file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: check if docker gpg key already present
+  stat:
+    path: /etc/apt/keyrings/docker.asc
+  register: docker_gpg_key
+
+- name: download docker gpg key
+  get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+  when: not docker_gpg_key.stat.exists
+
+- name: add docker apt repository
+  apt_repository:
+    repo: >-
+      deb [arch={{ ansible_architecture == 'x86_64' and 'amd64' or ansible_architecture }}
+      signed-by=/etc/apt/keyrings/docker.asc]
+      https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+    filename: docker
+    state: present
+
+- name: install docker engine
+  apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-compose-plugin
+    state: present
+    update_cache: true
+
+- name: make sure docker is enabled and running
+  systemd:
+    name: docker
+    enabled: true
+    state: started
+
+- name: add users to the docker group
+  user:
+    name: "{{ item }}"
+    groups: docker
+    append: true
+  loop: "{{ docker_bootstrap_users }}"
+  when: docker_bootstrap_users | length > 0

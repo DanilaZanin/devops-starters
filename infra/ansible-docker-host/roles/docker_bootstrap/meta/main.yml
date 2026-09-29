@@ -1,0 +1,14 @@
+---
+galaxy_info:
+  role_name: docker_bootstrap
+  description: Bootstraps a fresh Ubuntu host with Docker, node_exporter, ufw firewall rules and basic SSH hardening.
+  author: Danila Zanin
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - jammy
+        - noble
+
+dependencies: []

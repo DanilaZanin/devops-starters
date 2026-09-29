@@ -1,0 +1,30 @@
+---
+# Deliberately using lineinfile instead of a full sshd_config template —
+# this way the role only touches the specific directives it cares about
+# and leaves the rest of whatever config the base image/distro shipped alone.
+
+- name: disable password authentication
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^#?PasswordAuthentication"
+    line: "PasswordAuthentication no"
+    validate: "sshd -t -f %s"
+  when: ssh_disable_password_auth
+  notify: restart sshd
+
+- name: disable root login
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^#?PermitRootLogin"
+    line: "PermitRootLogin no"
+    validate: "sshd -t -f %s"
+  when: ssh_disable_root_login
+  notify: restart sshd
+
+- name: set ssh port
+  lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^#?Port"
+    line: "Port {{ ssh_port }}"
+    validate: "sshd -t -f %s"
+  notify: restart sshd
