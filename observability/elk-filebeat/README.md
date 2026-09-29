@@ -34,7 +34,7 @@ Requirements: docker with compose v2, python3, make. Budget roughly 4 GB of RAM 
 4. **Single-node cluster stuck yellow.** The index template sets replicas to 0.
 5. **Data lost on restart.** Elasticsearch data and Filebeat's registry live on named volumes; without the registry Filebeat would re-ship everything after a restart.
 
-6. **Raw Docker socket in a root container.** Mounting `/var/run/docker.sock:ro` into Filebeat does not make it read-only: the `:ro` flag covers the socket file, not the API behind it, so a compromised Filebeat could still create or kill containers. (Docker documents [the daemon attack surface](https://docs.docker.com/engine/security/).) Filebeat talks to `tecnativa/docker-socket-proxy` (pinned by tag and digest) instead, which allows GET requests for containers, events, info, ping and version and answers 403 to everything else (reproduced in tests). `tests/check_compose.py` also fails if any other service mounts the socket.
+6. **Raw Docker socket in a root container.** Mounting `/var/run/docker.sock:ro` into Filebeat does not make it read-only: the `:ro` flag covers the socket file, not the API behind it, so a compromised Filebeat could still create or kill containers. (Docker documents [the daemon attack surface](https://docs.docker.com/engine/security/).) Filebeat talks to a proxy instead: the pinned `tecnativa/docker-socket-proxy` (tag and digest) image with our own HAProxy config (`docker-proxy/haproxy.cfg`). The image's env switches allow whole prefixes (`CONTAINERS=1` also lets `GET /containers/{id}/attach/ws` through, which can feed stdin to a container), so the config allows only `GET /version`, `/info`, `/_ping`, `/containers/json`, `/containers/{id}/json` and `/events`, and answers 403 to everything else (reproduced in tests). `tests/check_compose.py` also fails if any other service mounts the socket.
 
 Ports are published on 127.0.0.1 only.
 
@@ -46,8 +46,8 @@ The smoke test starts from a clean slate, waits for the stack, and then checks t
 - logs of the labeled `demo-app` arrive in `app-logs-*`;
 - logs of the unlabeled `quiet-app` do not;
 - with the broken config swapped in, the unlabeled logs do arrive (so the previous check can fail);
-- the broken config still ships only this compose project: a container outside it that logs a marker line never reaches Elasticsearch, in either phase (the test config carries a `drop_event` processor for this; the real host may run other containers);
-- the Filebeat container has no Docker socket mount, and the proxy answers 200 for `GET /containers/json` and 403 for container create and kill, image and volume listing;
+- the broken config still ships only this compose project (its autodiscover template matches container names `<COMPOSE_PROJECT_NAME>-*`): a container outside it that logs a marker line never reaches Elasticsearch, and Filebeat's log never mentions its id, so its files are not even opened. The project name comes from `COMPOSE_PROJECT_NAME`, so `COMPOSE_PROJECT_NAME=other make test` works too; a failing teardown makes the run fail (`tests/cleanup_selftest.sh`);
+- the Filebeat container has no Docker socket mount, and the proxy answers 200 for exactly those six GET paths and 403 for `attach/ws`, `logs`, `archive`, `export`, `exec`, container create, kill and delete, image and volume listing;
 - the count helper fails on an unreachable Elasticsearch and on an HTTP 401 (it used to print 0 there, which made the "unlabeled logs are absent" check pass without Elasticsearch);
 - Kibana comes up.
 
@@ -62,7 +62,7 @@ Does NOT prove:
 
 - HTTP and transport TLS are off. Passwords cross the docker network in clear text. Turn TLS on (and provide certificates) before this leaves a single machine.
 - Single node, 512 MB heap, no snapshots. Production needs at least three nodes for the data tier, sized heap and snapshots to a repository.
-- Filebeat runs as root because it reads other containers' log files. The Docker API goes through the read-only proxy, but read access is not harmless: `GET /containers/{id}/json` returns every container's environment variables, and `/containers/{id}/archive` and `/export` are reachable too (the proxy filters by endpoint group, not by path). The proxy itself runs as root and holds the socket; keep it on the internal `docker-api` network, which only Filebeat joins. The config is copied into the image (`filebeat/Dockerfile`), not bind-mounted, so the stack also starts from a copy of the directory that the Docker VM cannot see (macOS `$TMPDIR` with colima); the same goes for `setup/setup.sh`. The smoke test builds the broken variant with `FILEBEAT_CONFIG=traps/filebeat.collect-all.yml`.
+- Filebeat runs as root because it reads other containers' log files. The Docker API goes through the read-only proxy, but read access is not harmless: `GET /containers/{id}/json` returns every container's environment variables (the one container endpoint left open). The proxy itself runs as root and holds the socket; keep it on the internal `docker-api` network, which only Filebeat joins. The config is copied into the image (`filebeat/Dockerfile`), not bind-mounted, so the stack also starts from a copy of the directory that the Docker VM cannot see (macOS `$TMPDIR` with colima); the same goes for `setup/setup.sh`. The smoke test builds the broken variant with `FILEBEAT_CONFIG=traps/filebeat.collect-all.yml`.
 - A daily index with a 7 day delete is the simplest retention. With real volume, use data streams with rollover by size.
 - Kibana's encryption key is a placeholder in `.env.example`. Generate your own.
 
@@ -77,4 +77,4 @@ labels:
 
 on each service whose logs you want. Keep `filebeat/filebeat.yml`, `setup/setup.sh`, `.env.example` and the `elasticsearch`, `setup`, `kibana`, `filebeat` and `docker-proxy` services together. The whole folder also works on its own: `cp -r observability/elk-filebeat /elsewhere && cd /elsewhere && make test`.
 
-Pins: Elasticsearch, Kibana and Filebeat 9.5.4, docker-socket-proxy v0.5.0 (digest `sha256:1f5038b5...3459`, checked against Docker Hub on 2026-09-30), BusyBox 1.37.0 for the demo containers.
+Pins: Elasticsearch, Kibana and Filebeat 9.5.4, docker-socket-proxy v0.5.0 as the base of `docker-proxy/Dockerfile` (digest `sha256:1f5038b5...3459`, checked against Docker Hub on 2026-09-30), BusyBox 1.37.0 for the demo containers.

@@ -57,7 +57,7 @@ Proves:
 Does NOT prove:
 - Behavior of a Redis that is slow but not dead, or a partial outage where reads work and writes fail.
 - A race between invalidation and a load that is already in flight: that load can write the old value back after `DELETE`. Versioned keys or a short TTL are the usual answers.
-- Correctness across many app replicas. The lock is a single-Redis lock, which is enough for single-flight (a rare duplicate load is harmless) but is not a mutual-exclusion guarantee. A load that runs longer than `LOCK_TTL_MS` is not cached, and another request may start a second load for the same key; size the lease above your slowest normal load.
+- Correctness across many app replicas. The lock is a single-Redis lock, which is enough for single-flight (a rare duplicate load is harmless) but is not a mutual-exclusion guarantee. A load that runs longer than `LOCK_TTL_MS` is not cached, and another replica may start a second load for the same key (inside one process it joins the load already running); size the lease above your slowest normal load.
 - Stampede protection across processes on the fail-open path: while Redis is down, each app process makes one source call per key at a time (requests inside a process are merged), so N replicas make up to N. That is the trade.
 - Performance under real load. The source is a `sleep`.
 

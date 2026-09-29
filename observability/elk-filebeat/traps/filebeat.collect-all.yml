@@ -4,34 +4,43 @@
 # smoke test swaps it in to prove that its "unlabeled logs must not appear" check
 # really fails when opt-in is broken.
 #
-# The one addition is the drop_event processor at the end. It is test isolation: the
-# broken input would otherwise read every container on the Docker host, and the smoke
-# test must not ship a stranger's logs. Only containers of this compose project reach
-# Elasticsearch; the unlabeled quiet-app is one of them, which is all the test needs.
+# The differences: no `enabled: false`, and the templates condition + drop_event that keep the
+# broken input inside this compose project, so the smoke test never ships a stranger's logs.
 filebeat.autodiscover:
   providers:
     - type: docker
       # docker-proxy allows read-only calls only; there is no Docker socket in this container.
       host: "tcp://docker-proxy:2375"
-      hints.enabled: true
-      hints.default_config:
-        type: filestream
-        # Filestream needs a unique id per input. The `container` input of older
-        # Filebeat versions is gone in 9.x.
-        id: container-${data.container.id}
-        parsers:
-          - container: ~
-        paths:
-          - /var/lib/docker/containers/${data.container.id}/*.log
+      # No hints and no opt-in: every container OF THIS COMPOSE PROJECT is collected
+      # whatever its labels say. The condition keeps the input (and so the file reads)
+      # away from containers outside the project; the project name comes from the
+      # COMPOSE_PROJECT_NAME environment variable that compose passes in.
+      hints.enabled: false
+      templates:
+        - condition:
+            # Compose names containers <project>-<service>-<n>. (The label is not usable
+            # here: autodiscover nests dotted label keys.)
+            regexp:
+              docker.container.name: "^${COMPOSE_PROJECT_NAME}-.+-[0-9]+$"
+          config:
+            - type: filestream
+              # Filestream needs a unique id per input. The `container` input of older
+              # Filebeat versions is gone in 9.x.
+              id: container-${data.docker.container.id}
+              parsers:
+                - container: ~
+              paths:
+                - /var/lib/docker/containers/${data.docker.container.id}/*.log
 
 processors:
   - add_docker_metadata:
       host: "tcp://docker-proxy:2375"
+  # Second line of defence, should the condition above ever be loosened.
   - drop_event:
       when:
         not:
           equals:
-            container.labels.com_docker_compose_project: elk-filebeat
+            container.labels.com_docker_compose_project: "${COMPOSE_PROJECT_NAME}"
 
 setup.ilm.enabled: false
 setup.template.enabled: false

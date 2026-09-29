@@ -13,10 +13,12 @@ def retry_arguments(settings: Settings, queue_type: str = "quorum") -> dict:
 
     The TTL -> main hop happens inside the broker, where the consumer's publisher
     confirms do not reach. In a classic queue that hop is at-most-once: if the
-    destination refuses the message at that moment (full with overflow=reject-publish,
-    leader down), the message is dropped. A quorum queue with
-    x-dead-letter-strategy=at-least-once keeps it and retries the hop. That strategy
-    needs x-overflow=reject-publish and a quorum queue as the destination.
+    destination cannot take the message at that moment (no queue bound, leader down),
+    the message is dropped. A quorum queue with x-dead-letter-strategy=at-least-once
+    keeps it and retries the hop. That strategy is set on the quorum SOURCE queue (this
+    one) together with x-overflow=reject-publish; the destination may be a classic queue.
+    The retry interval is the broker's dead_letter_worker_publisher_confirm_timeout
+    (180 s by default, see docker-compose.yml).
     """
     quorum = queue_type == "quorum"
     return {

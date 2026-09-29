@@ -10,6 +10,11 @@ services:
       # Setting these replaces the built-in guest/guest user instead of adding to it.
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?set RABBITMQ_USER in .env}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}
+      # How long the at-least-once dead-letter worker waits for the destination to confirm
+      # before it publishes again. The broker default is 180000 ms: a hop that the
+      # destination refused (or could not route) is retried only every 3 minutes. Lowered
+      # so the trap test finishes in seconds; pick a value for your own latency budget.
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-rabbit dead_letter_worker_publisher_confirm_timeout 5000"
     ports:
       - "127.0.0.1:5672:5672"
       - "127.0.0.1:15672:15672"

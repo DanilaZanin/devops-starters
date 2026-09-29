@@ -243,41 +243,101 @@ def test_publish_confirmed_rejects_unroutable_message(settings, probe):
 
 # ---------- trap 3: the broker-internal TTL -> main hop (dead-letter safety)
 
-def run_refused_destination_scenario(settings, probe, queue_type) -> bool:
-    """The main queue is full (max-length 1, reject-publish) when a message leaves the
-    retry queue. Space frees up a moment later. Did the message survive the wait?"""
+@dataclass
+class RefusedHopOutcome:
+    fillers: int  # messages the destination took before it nacked a publish (it refuses from then on)
+    refused_after_ttl: bool  # it still nacked once the message's TTL had fired
+    delivered_after_recovery: bool
+
+
+def refuses(publisher, settings) -> bool:
+    try:
+        publish_confirmed(publisher, settings.main_exchange, settings.main_queue, b'{"order_id": "probe"}')
+    except PublishFailed:
+        return True  # nack from x-overflow=reject-publish
+    return False
+
+
+def run_refused_destination_scenario(settings, probe, retry_type, main_type="quorum", outage="full") -> RefusedHopOutcome:
+    """A message's TTL fires in the retry queue while the main queue cannot take it. Did the
+    message survive?
+
+    outage="full":   the main queue is full (x-max-length=1, x-overflow=reject-publish). The
+                     test fills it until the broker nacks a publish (quorum queues accept a
+                     message or two over the limit) and checks again after the TTL. Only then
+                     are the fillers consumed.
+    outage="absent": there is no main queue (deleted in a deploy), so the dead-letter publish
+                     cannot be routed. The probe publish comes back unroutable, before and
+                     after the TTL. The queue is declared afterwards.
+
+    Either way `refused_after_ttl` proves the destination was refusing when the TTL fired;
+    the classic retry queue (at-most-once) counts a refused hop as delivered."""
     channel = probe.channel()
     for exchange in (settings.main_exchange, settings.retry_exchange):
         channel.exchange_declare(exchange, exchange_type="direct", durable=True)
-    channel.queue_declare(
-        settings.main_queue,
-        durable=True,
-        arguments={**queue_arguments(queue_type), "x-max-length": 1, "x-overflow": "reject-publish"},
-    )
-    channel.queue_bind(settings.main_queue, settings.main_exchange, routing_key=settings.main_queue)
-    channel.queue_declare(settings.retry_queue, durable=True, arguments=retry_arguments(settings, queue_type))
+
+    def declare_main():
+        limits = {"x-max-length": 1, "x-overflow": "reject-publish"} if outage == "full" else {}
+        channel.queue_declare(settings.main_queue, durable=True, arguments={**queue_arguments(main_type), **limits})
+        channel.queue_bind(settings.main_queue, settings.main_exchange, routing_key=settings.main_queue)
+
+    if outage == "full":
+        declare_main()
+    channel.queue_declare(settings.retry_queue, durable=True, arguments=retry_arguments(settings, retry_type))
     channel.queue_bind(settings.retry_queue, settings.retry_exchange, routing_key=settings.retry_queue)
 
     publisher = open_publisher_channel(probe)
-    publish_confirmed(publisher, settings.main_exchange, settings.main_queue, b'{"order_id": "filler"}')
+    fillers = 0
+    while not refuses(publisher, settings):  # a probe that got in becomes a filler
+        fillers += 1
+        assert fillers < 20, "the destination never started refusing"
     publish_confirmed(publisher, settings.retry_exchange, settings.retry_queue, b'{"order_id": "in-flight"}')
-    time.sleep(settings.retry_delay_ms / 1000 + 1.0)  # the TTL fires while main is full
+    time.sleep(settings.retry_delay_ms / 1000 + 1.5)  # the TTL fires while main refuses
+    refused_after = refuses(publisher, settings)
+    if outage == "absent":
+        declare_main()
 
-    channel.basic_get(settings.main_queue, auto_ack=True)  # free the slot
-    def in_flight_arrived() -> bool:
-        method, _, body = channel.basic_get(settings.main_queue, auto_ack=False)
-        if method is not None:
-            channel.basic_nack(method.delivery_tag, requeue=True)
-        return body is not None and b"in-flight" in body
-    return wait_until(in_flight_arrived, timeout=10, interval=0.5)
+    arrived = False
+
+    def drain_and_look() -> bool:
+        """Consume the fillers; report whether the in-flight message has shown up."""
+        nonlocal arrived
+        while True:
+            method, _, body = channel.basic_get(settings.main_queue, auto_ack=False)
+            if method is None:
+                return arrived
+            if b"in-flight" in body:
+                arrived = True
+                channel.basic_nack(method.delivery_tag, requeue=True)
+                return True
+            channel.basic_ack(method.delivery_tag)
+
+    return RefusedHopOutcome(fillers, refused_after, wait_until(drain_and_look, timeout=15, interval=0.5))
 
 
 def test_classic_retry_queue_drops_message_when_destination_refuses(settings, probe):
-    assert not run_refused_destination_scenario(settings, probe, "classic")
+    outcome = run_refused_destination_scenario(settings, probe, "classic", outage="absent")
+    assert outcome.refused_after_ttl, outcome
+    assert not outcome.delivered_after_recovery, "at-most-once must have dropped it"
 
 
 def test_quorum_retry_queue_keeps_message_when_destination_refuses(settings, probe):
-    assert run_refused_destination_scenario(settings, probe, "quorum")
+    outcome = run_refused_destination_scenario(settings, probe, "quorum")
+    assert outcome.refused_after_ttl, outcome
+    assert outcome.delivered_after_recovery, "at-least-once must retry until the destination takes it"
+
+
+def test_quorum_retry_queue_keeps_message_when_destination_is_missing(settings, probe):
+    outcome = run_refused_destination_scenario(settings, probe, "quorum", outage="absent")
+    assert outcome.refused_after_ttl, outcome
+    assert outcome.delivered_after_recovery, "at-least-once retries an unroutable hop too"
+
+
+def test_quorum_retry_queue_delivers_to_a_classic_destination(settings, probe):
+    """RabbitMQ requires a quorum SOURCE queue for at-least-once; the destination may be classic."""
+    outcome = run_refused_destination_scenario(settings, probe, "quorum", main_type="classic")
+    assert outcome.refused_after_ttl, outcome
+    assert outcome.delivered_after_recovery
 
 
 # ---------------------------------------------------- retry policy (fixed)

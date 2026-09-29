@@ -9,8 +9,9 @@ import dataclasses
 import time
 
 import httpx
+import pytest
 
-from app.cache import CacheAside, make_key
+from app.cache import CacheAside, make_client, make_key
 from app.main import create_app
 from app.source import ProductSource
 from traps.broken_cache import BrokenCacheAside
@@ -173,36 +174,65 @@ def test_source_slower_than_the_old_wait_budget_is_still_loaded_once(settings, s
     assert source.calls == 1, f"{source.calls} source calls for a 2.5 s load"
 
 
-def test_loader_that_outlives_its_lease_cannot_overwrite_the_new_owners_value(settings, sync_redis):
-    """A is slow and loses its lease; B takes over and caches the fresh value; A must not
-    write its stale result over it when it finally finishes."""
-    settings = dataclasses.replace(settings, lock_ttl_ms=300)
+def test_takeover_after_lease_expiry_shares_the_running_load(settings, sync_redis):
+    """The load (2.5 s) outlives the lease (1 s): a waiter takes the lock over while the first
+    loader is still running. In one process both must share that one call to the source."""
+    settings = dataclasses.replace(settings, lock_ttl_ms=1000)
+    source = ProductSource(latency_s=2.5)
+    responses = stampede(CacheAside, settings, source)
 
-    class SlowThenFast(ProductSource):
-        async def fetch(self, product_id):
-            self.calls += 1
-            if self.calls == 1:
-                await asyncio.sleep(1.0)
-                return {"version": "stale"}
+    assert all(r.status_code == 200 for r in responses)
+    assert source.calls == 1, f"{source.calls} source calls: the takeover loader ran on its own"
+    assert sync_redis.exists(lock_key_of(settings)) == 0
+
+
+def test_loader_that_outlives_its_lease_cannot_overwrite_the_new_owners_value(settings, sync_redis):
+    """Two replicas (two CacheAside objects, so no shared in-process load). A is slow and loses
+    its lease; B takes over and caches the fresh value; A must not write its stale result over
+    it when it finally finishes."""
+    settings = dataclasses.replace(settings, lock_ttl_ms=300)
+    key = make_key(settings.key_prefix, "product", id=1)
+
+    async def scenario():
+        replica_a, replica_b = (CacheAside(make_client(settings), settings) for _ in range(2))
+
+        async def slow():
+            await asyncio.sleep(1.0)
+            return {"version": "stale"}
+
+        async def fast():
             return {"version": "fresh"}
 
-    source = SlowThenFast()
-    app = create_app(settings, CacheAside, source)
-
-    async def requests(client):
-        slow = asyncio.create_task(client.get("/products/1"))
+        slow_task = asyncio.create_task(replica_a.get_or_load(key, slow))
         await asyncio.sleep(0.6)  # A's lease (300 ms) has expired, A is still loading
-        fresh = await client.get("/products/1")
-        stale = await slow
-        after = await client.get("/products/1")
+        fresh = await replica_b.get_or_load(key, fast)
+        stale = await slow_task
+        after = await replica_b.get_or_load(key, fast)
         return fresh, stale, after
 
-    fresh, stale, after = asyncio.run(call(app, requests))
+    fresh, stale, after = asyncio.run(scenario())
 
-    assert fresh.json() == {"version": "fresh"}
-    assert stale.json() == {"version": "stale"}  # A still answers its own caller
-    assert after.json() == {"version": "fresh"}, "the late writer clobbered the newer value"
+    assert fresh == ({"version": "fresh"}, "miss")
+    assert stale[0] == {"version": "stale"}  # A still answers its own caller
+    assert after == ({"version": "fresh"}, "hit"), "the late writer clobbered the newer value"
     assert sync_redis.exists(lock_key_of(settings)) == 0
+
+
+def test_lock_is_released_when_the_value_cannot_be_serialised(settings, sync_redis):
+    """json.dumps fails after the load: the request errors, but the lock must not stay until its TTL."""
+    key = make_key(settings.key_prefix, "product", id=1)
+
+    async def scenario():
+        cache = CacheAside(make_client(settings), settings)
+
+        async def loader():
+            return {"not json": object()}
+
+        with pytest.raises(TypeError):
+            await cache.get_or_load(key, loader)
+
+    asyncio.run(scenario())
+    assert sync_redis.exists(key + ":lock") == 0, "lock leaked until TTL"
 
 
 # -------------------------------------------------- normal cache behavior

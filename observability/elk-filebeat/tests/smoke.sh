@@ -8,7 +8,9 @@
 # deleted first) and, when it exits for any reason, deletes them again, so no test
 # document stays in the index. The broken config ships only containers of this compose
 # project (see the drop_event processor in it), never other containers on the host; a
-# stranger container that logs a marker line proves that.
+# stranger container that logs a marker line proves that, and Filebeat's own log must
+# never mention that container (no input, no file read). The project name comes from
+# COMPOSE_PROJECT_NAME, so the run also works under another name.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -28,16 +30,27 @@ fail() {
   exit 1
 }
 
+# Runs on every exit. A failed teardown leaves containers, volumes or a broken filebeat
+# image behind, so it is reported and turns a passing run into a failing one.
 cleanup() {
   local status=$?
   trap - EXIT
-  docker rm -f "$FOREIGN" >/dev/null 2>&1 || true
-  "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-  # The filebeat image tag holds the broken config after the trap phase; put the real one back.
-  "${COMPOSE[@]}" build filebeat >/dev/null 2>&1 || true
+  local step
+  for step in "rm -f $FOREIGN" "compose down -v --remove-orphans" "compose build filebeat"; do
+    # shellcheck disable=SC2086
+    if ! docker $step >/dev/null; then
+      echo "SMOKE CLEANUP FAILED: docker ${step}" >&2
+      [ "$status" -ne 0 ] || status=1
+    fi
+  done
   exit "$status"
 }
 trap cleanup EXIT
+# tests/cleanup_selftest.sh runs the script up to here with a broken `docker` on PATH.
+[ "${SMOKE_CLEANUP_SELFTEST:-}" != 1 ] || exit 0
+
+# Names derive from the compose project (COMPOSE_PROJECT_NAME or the file's default).
+PROJECT="$("${COMPOSE[@]}" config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["name"])')"
 
 # Any HTTP error (4xx/5xx) or connection failure makes curl, and so the caller, fail.
 es() {
@@ -115,17 +128,35 @@ echo "ok: the filebeat container has no Docker socket"
 
 proxy_healthy() { [ "$(docker inspect -f '{{.State.Health.Status}}' "$("${COMPOSE[@]}" ps -q docker-proxy)")" = healthy ]; }
 wait_for "docker-proxy is healthy" "$TIMEOUT" proxy_healthy || fail "docker-proxy never became healthy"
-proxy_status() {  # METHOD PATH -> HTTP status, asked from the proxy's own internal network
-  docker run --rm --network "elk-filebeat_docker-api" --entrypoint curl \
+proxy_status() {  # METHOD PATH [curl args] -> HTTP status, asked from the proxy's own internal network
+  local method="$1" path="$2"
+  shift 2
+  # --max-time: /events streams forever; the status line arrives first and is what we read.
+  docker run --rm --network "${PROJECT}_docker-api" --entrypoint curl \
     docker.elastic.co/elasticsearch/elasticsearch:9.5.4 \
-    -s -o /dev/null -w '%{http_code}' -X "$1" "http://docker-proxy:2375$2"
+    -s -o /dev/null --max-time 3 -w '%{http_code}' -X "$method" "$@" "http://docker-proxy:2375${path}" || true
 }
-[ "$(proxy_status GET /containers/json)" = "200" ] || fail "docker-proxy does not answer GET /containers/json"
-for denied in "POST /containers/create" "POST /containers/x/kill" "GET /images/json" "GET /volumes"; do
+DEMO_ID="$(docker inspect -f '{{.Id}}' "$("${COMPOSE[@]}" ps -q demo-app)")"
+# Exactly what Filebeat's docker autodiscover needs:
+for allowed in /version /info /_ping /containers/json "/containers/${DEMO_ID}/json" /v1.41/containers/json "/events?since=0&until=1"; do
+  [ "$(proxy_status GET "$allowed")" = "200" ] || fail "docker-proxy refused an allowed path: GET ${allowed}"
+done
+# ... and nothing else: no websocket attach (stdin!), logs, archive, exec, writes, other APIs.
+for denied in "GET /containers/${DEMO_ID}/attach/ws?stream=1&stdin=1&stdout=1" \
+  "GET /containers/${DEMO_ID}/logs?stdout=1" "GET /containers/${DEMO_ID}/archive?path=/" \
+  "GET /containers/${DEMO_ID}/export" "GET /containers/${DEMO_ID}/top" "GET /containers/${DEMO_ID}/exec" \
+  "GET /exec/x/json" "POST /containers/${DEMO_ID}/exec" "POST /containers/${DEMO_ID}/attach" \
+  "POST /containers/create" "POST /containers/${DEMO_ID}/kill" "DELETE /containers/${DEMO_ID}" \
+  "GET /images/json" "GET /volumes" "GET /containers/../images/json"; do
   # shellcheck disable=SC2086
   [ "$(proxy_status $denied)" = "403" ] || fail "docker-proxy allowed: ${denied}"
 done
-echo "ok: docker-proxy allows read-only container/event queries and refuses writes and other APIs"
+# A websocket upgrade is refused even on an allowed path (HAProxy answers 400 or 403).
+case "$(proxy_status GET /containers/json -H 'Connection: Upgrade' -H 'Upgrade: websocket')" in
+  400|403) ;;
+  *) fail "docker-proxy let a websocket upgrade through" ;;
+esac
+echo "ok: docker-proxy answers only the Filebeat allowlist and refuses attach/ws, logs, exec, writes and other APIs"
 
 # A container outside this compose project that logs a marker: it must never reach Elasticsearch.
 docker run -d --name "$FOREIGN" --network none busybox:1.37.0 \
@@ -149,6 +180,11 @@ wait_for "trap reproduced: the collect-all config ships the unlabeled logs" 180 
 sleep 10
 foreign="$(strict_count "foreign log line ${RUN_ID}")"
 [ "$foreign" = "0" ] || fail "the broken config shipped a container outside this compose project: the test is not isolated"
+# The check on Filebeat's log must be able to see an input at all: the project's own container shows up.
+fb_log="$("${COMPOSE[@]}" logs --no-color filebeat)"
+grep -q "${DEMO_ID}" <<<"$fb_log" || fail "Filebeat's log never mentions the project's own container: cannot check the foreign one"
+FOREIGN_ID="$(docker inspect -f '{{.Id}}' "$FOREIGN")"
+if grep -q "${FOREIGN_ID}" <<<"$fb_log"; then fail "the broken config opened files of a container outside this compose project"; fi
 echo "ok: even the broken config never shipped the foreign container's logs"
 
 echo "restoring the real config ..."

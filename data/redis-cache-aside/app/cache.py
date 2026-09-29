@@ -114,12 +114,13 @@ class CacheAside:
         except CacheUnavailable as exc:
             # Fail open: a broken cache must cost latency, not availability.
             log.warning("cache unavailable (%s), serving from the source", exc)
-        return await self._bypass(key, loader), "bypass"
+        return await self._single_flight(key, loader), "bypass"
 
-    async def _bypass(self, key: str, loader: Loader) -> Any:
-        """Load without the lock, but let concurrent bypass requests for one key share
-        a single call to the source. Bounds the cost of a dead Redis or a spent wait
-        budget to one call per key per process instead of one per request.
+    async def _single_flight(self, key: str, loader: Loader) -> Any:
+        """Every load in this process (lock holder, takeover after a lease expiry, or
+        bypass) goes through here, so concurrent loads of one key share a single call to
+        the source. Bounds the cost of a dead Redis, a spent wait budget or a load that
+        outlives its lease to one call per key per process instead of one per request.
         ponytail: per process; across replicas it is still one call each."""
         task = self._inflight.get(key)
         if task is None:
@@ -139,9 +140,9 @@ class CacheAside:
             raw = await self._redis(self.client.get(key))
             if raw is not None:
                 return json.loads(raw), "hit"
-            value = await loader()
-            settled = True
+            value = await self._single_flight(key, loader)
             await self._store_and_release(key, lock_key, token, value)
+            settled = True  # only after the script ran: json.dumps may raise before it
             return value, "miss"
         finally:
             if not settled:

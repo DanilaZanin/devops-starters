@@ -33,14 +33,14 @@ Requirements: docker with compose v2, [uv](https://docs.astral.sh/uv/), make. `m
 
 | Verified on | RAM | First run (cold image cache) |
 |---|---|---|
-| 2026-09-29, macOS arm64, colima 4 CPU / 8 GB, RabbitMQ 4.3.6, `make test`: 14 passed (not yet run on an ubuntu-24.04 runner) | about 120 MiB (RabbitMQ container, sampled with `docker stats`) | about 30 s including the image pull; about 35 s with the image cached (quorum queues and the dead-letter scenarios add wait time) |
+| 2026-09-29, macOS arm64, colima 4 CPU / 8 GB, RabbitMQ 4.3.6, `make test`: 16 passed (not yet run on an ubuntu-24.04 runner) | about 120 MiB (RabbitMQ container, sampled with `docker stats`) | about 30 s including the image pull; about 35 s with the image cached (quorum queues and the dead-letter scenarios add wait time) |
 
 ## Traps this avoids
 
 1. **Poison message loops forever** (reproduced in tests). Invalid JSON goes straight to the DLQ with the parse error in the `x-last-error` header, without retries. The good message behind it is processed.
 2. **Republish + ack without confirms loses messages** (reproduced in tests). Retry and DLQ publishes use a confirm-mode channel with `mandatory=True`. If the broker cannot route or accept the copy, the original is nacked back to the queue instead of acked.
 3. **Garbage in the retry-count header kills the consumer** (reproduced in tests). `x-retry-count` comes from the wire. If it is not a non-negative integer, the message goes to the DLQ like any other poison message. Parsed outside the protected block, `int("bad")` crashes the consumer before the ack, and with `restart: unless-stopped` it crash-loops on the same message forever.
-4. **The TTL to main hop is at-most-once in a classic queue** (reproduced in tests). Publisher confirms cover the consumer's publish into the retry queue, not the broker-internal dead-lettering from the retry queue back to `orders`. If `orders` refuses the message at that moment (full with `reject-publish`, leader unavailable), a classic queue drops it. The queues here are quorum queues and the retry queue uses `x-dead-letter-strategy: at-least-once`, which keeps the message and retries the hop. See [Dead Letter Exchanges](https://www.rabbitmq.com/docs/dlx) in the RabbitMQ docs (the safety section).
+4. **The TTL to main hop is at-most-once in a classic queue** (reproduced in tests). Publisher confirms cover the consumer's publish into the retry queue, not the broker-internal dead-lettering from the retry queue back to `orders`. If `orders` cannot route the message at that moment (queue missing or unbound, leader unavailable), a classic retry queue drops it (a full `reject-publish` queue does not stop an at-most-once dead-letter, the message goes in over the limit). The queues here are quorum queues and the retry queue uses `x-dead-letter-strategy: at-least-once`, which keeps the message and retries the hop. See [Dead Letter Exchanges](https://www.rabbitmq.com/docs/dlx) in the RabbitMQ docs (the safety section).
 5. **Retry count is bounded.** `MAX_RETRIES=3` means one first attempt plus exactly three retries (four handler calls), then the DLQ. The count travels in the `x-retry-count` header.
 6. **Default `guest` user and open ports.** The broker is started with a user from `.env` (which replaces `guest`), and ports are published on 127.0.0.1 only.
 7. **`depends_on: service_healthy` is not a guarantee.** `rabbitmq-diagnostics ping` can pass before the AMQP listener accepts connections. The healthcheck uses `check_port_connectivity`, and `connect()` retries anyway.
@@ -54,7 +54,7 @@ Proves:
 - when the retry queue has disappeared, the broken consumer acks and loses the message; the real one keeps it;
 - with a poison message at the head of the queue, the broken consumer is redelivered the same message over and over (at least 3 deliveries counted), the good message behind it is never handled and nothing reaches the DLQ; the real one sees the poison message exactly once;
 - a garbage `x-retry-count` header (`"bad"`, `-1`, `1.5`) crash-loops the broken consumer across restarts; the real one dead-letters it and still handles the next message;
-- when the main queue is full at the moment the TTL fires, a classic retry queue drops the message and the quorum one delivers it once space frees up;
+- when the main queue cannot take the message at the moment the TTL fires, a classic retry queue drops it and the quorum one delivers it once the queue recovers. Each case first shows that the destination really refuses (a probe publish is nacked by a full `reject-publish` queue, or comes back unroutable from a missing queue) before and after the TTL; a quorum retry queue also delivers into a classic main queue;
 - a failing message is handled exactly `MAX_RETRIES + 1` times, then lands in the DLQ with its error and retry count;
 - a message that recovers on a retry is not dead-lettered;
 - `guest/guest` is rejected.
@@ -64,7 +64,7 @@ Does NOT prove:
 - The message-loss trap is reproduced by deleting the retry queue while the consumer runs. Other causes (a broker resource alarm, a network drop between publish and confirm) are not tested.
 - Broker restarts, disk persistence and clustering.
 - Throughput. A confirm per message is slow; at volume you batch confirms.
-- The limits of at-least-once dead-lettering. It protects a destination that is refusing or unavailable. It does not help when the destination exchange has no matching binding: that is an unroutable message and the broker discards it as delivered. It also needs the destination to be a quorum queue; a classic destination gets no guarantee. One node only, so leader failover is not exercised.
+- The limits of at-least-once dead-lettering. RabbitMQ requires the strategy on the quorum source queue (here the retry queue); the destination may be classic, and a refused or unroutable dead-letter publish is retried. The retry only happens every `dead_letter_worker_publisher_confirm_timeout` (180 s by default; `docker-compose.yml` lowers it to 5 s so the test finishes), so a refused hop delays the message by that long. Classic queues get no such guarantee: a source that is not quorum drops a refused or unroutable hop. One node only, so leader failover is not exercised.
 - The quorum delivery limit. RabbitMQ 4.x quorum queues drop a message after 20 redeliveries by default (no DLX is configured on `orders`). The consumer only requeues when a confirmed publish fails, so it is unlikely to reach that, but a long broker outage could.
 
 ## Local demo vs production

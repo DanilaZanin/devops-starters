@@ -28,6 +28,7 @@ lint: .env ## Static checks that need no running containers
 	python3 tests/check_compose.py
 
 test: check-prereqs lint ## Config checks, then an end-to-end smoke run (wipes this module's data first)
+	bash tests/cleanup_selftest.sh
 	bash tests/smoke.sh
 
 logs: ## Follow Filebeat's own log

@@ -1,4 +1,4 @@
-name: elk-filebeat
+name: ${COMPOSE_PROJECT_NAME:-elk-filebeat}
 
 services:
   elasticsearch:
@@ -78,6 +78,8 @@ services:
         condition: service_healthy
     environment:
       FILEBEAT_PASSWORD: ${FILEBEAT_PASSWORD:?set FILEBEAT_PASSWORD in .env}
+      # Only the collect-all trap config reads it (to stay inside this project).
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-elk-filebeat}
     networks:
       - default
       - docker-api
@@ -91,20 +93,17 @@ services:
       retries: 3
       start_period: 20s
 
-  # The only container that touches the Docker socket. HAProxy in front of it answers
-  # GET requests for containers, events, info, ping and version and refuses everything else
-  # (POST is off), so a compromised Filebeat cannot create, kill or exec anything.
+  # The only container that touches the Docker socket. HAProxy in front of it (own config,
+  # docker-proxy/haproxy.cfg) answers GET for a path allowlist only: /version, /info, /_ping,
+  # /containers/json, /containers/{id}/json and /events. Everything else gets 403 (POST, exec,
+  # logs, archive, and the attach/ws websocket that could feed stdin to a container).
   # It sits on an internal network shared with Filebeat only.
-  # Note: read access to /containers still exposes every container's environment
+  # Note: read access to /containers/{id}/json still exposes every container's environment
   # (`docker inspect`), see the README.
   docker-proxy:
-    # Pinned by tag and digest (manifest list, checked against Docker Hub on 2026-09-30).
-    image: tecnativa/docker-socket-proxy:v0.5.0@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459
-    environment:
-      CONTAINERS: "1"
-      EVENTS: "1"
-      INFO: "1"  # Filebeat's Docker client asks for /info when it starts
-      POST: "0"
+    build:
+      context: .
+      dockerfile: docker-proxy/Dockerfile
     networks:
       - docker-api
     volumes:
