@@ -1,0 +1,49 @@
+---
+- name: Prepare
+  ansible.builtin.import_playbook: ../shared/prepare.yml
+
+- name: Pin ssh.socket to port 22
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Create the socket drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/ssh.socket.d
+        state: directory
+        mode: "0755"
+
+    - name: Install a socket drop-in that sorts after the generated addresses.conf
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/ssh.socket.d/zz-pin-port-22.conf
+        content: |
+          [Socket]
+          ListenStream=
+          ListenStream=0.0.0.0:22
+          ListenStream=[::]:22
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Restart ssh.socket on the pinned port
+      ansible.builtin.systemd_service:
+        name: ssh.socket
+        state: restarted
+        daemon_reload: true
+        enabled: true
+
+    - name: Precondition, sshd is reachable on port 22
+      ansible.builtin.wait_for:
+        port: 22
+        host: 127.0.0.1
+        timeout: 15
+
+    - name: Start a foreign (non-ssh) listener on the new ssh port
+      ansible.builtin.command: >-
+        systemd-run --unit=impostor-listener python3 -m http.server 2222 --bind 0.0.0.0
+      changed_when: true
+
+    - name: Precondition, the foreign listener answers on 2222
+      ansible.builtin.wait_for:
+        port: 2222
+        host: 127.0.0.1
+        timeout: 15

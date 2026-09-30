@@ -73,6 +73,8 @@ trap: check-prereqs deps
 access: check-prereqs deps
 	@echo ">> access: an unreachable new ssh port must not close port 22"
 	molecule test -s lockout
+	@echo ">> access: a foreign process on the new port must not pass for sshd"
+	molecule test -s impostor
 	@echo ">> access: a working non-default ssh port (22.04 plain sshd, 24.04 ssh.socket)"
 	molecule test -s customport
 
@@ -96,6 +98,7 @@ down:
 	-molecule destroy -s default
 	-molecule destroy -s broken
 	-molecule destroy -s lockout
+	-molecule destroy -s impostor
 	-molecule destroy -s customport
 	-molecule destroy -s keytrust
 

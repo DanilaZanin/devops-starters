@@ -1,0 +1,32 @@
+---
+- name: Verify the lockout was prevented (foreign listener)
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Read why the role stopped
+      ansible.builtin.slurp:
+        src: /var/tmp/role-failure.txt
+      register: role_failure
+
+    - name: Read ufw status
+      ansible.builtin.command: ufw status
+      register: ufw_status
+      changed_when: false
+      failed_when: false
+
+    - name: List listening tcp sockets
+      ansible.builtin.command: ss -Hltn
+      register: listeners
+      changed_when: false
+
+    - name: Access is preserved
+      ansible.builtin.assert:
+        that:
+          - "'SSH_PORT_NOT_SSHD' in (role_failure.content | b64decode)"
+          - "'Status: active' not in ufw_status.stdout"
+          - listeners.stdout_lines | select('search', ':22\\s') | list | length > 0
+        fail_msg: >-
+          ACCESS_LOST: the role must stop with SSH_PORT_NOT_SSHD before ufw is
+          enabled and port 22 must still listen. Role said:
+          {{ role_failure.content | b64decode }}; ufw: {{ ufw_status.stdout }}
+        quiet: true

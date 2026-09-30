@@ -72,3 +72,33 @@
       the sshd change. ufw was not modified, so the previous ssh port still works. If
       ssh.socket is customised (ListenStream in /etc/systemd/system/ssh.socket.d), align it
       with docker_bootstrap_ssh_port or disable socket activation.
+
+# An open port is not proof that it is SSH: with ssh.socket still on 22, some other
+# process may hold the new port. Require a host key served there that matches one of
+# this host's own /etc/ssh/ssh_host_*_key.pub, so ufw never closes the working port.
+- name: Prove the listener on the configured port is this host's sshd
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -o pipefail
+      ssh-keyscan -T 5 -p {{ docker_bootstrap_ssh_port | int }} 127.0.0.1 2>/dev/null \
+        | awk '!/^#/ && NF >= 3 {print $3}' \
+        | { while read -r key; do
+              [ -n "$key" ] && grep -qsF -- "$key" /etc/ssh/ssh_host_*_key.pub && exit 0
+            done; exit 1; }
+  register: docker_bootstrap_sshd_hostkey
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  retries: 3
+  delay: 2
+  until: docker_bootstrap_sshd_hostkey.rc == 0
+
+- name: Stop if the listener is not sshd
+  ansible.builtin.assert:
+    that: docker_bootstrap_sshd_hostkey.rc == 0
+    fail_msg: >-
+      SSH_PORT_NOT_SSHD: port {{ docker_bootstrap_ssh_port }} is open but does not present
+      a host key of this machine's sshd (another process holds it, or ssh.socket is still
+      on the old port). ufw was not modified, so the previous ssh port still works.
+    quiet: true

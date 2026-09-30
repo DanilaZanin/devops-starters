@@ -201,15 +201,19 @@ def outcome(doc: dict, job: dict, env: dict[str, str]) -> tuple[str, bool] | Non
         return None
     rules = job.get("rules")
     if not rules:
-        return job.get("when", "on_success"), bool(job.get("allow_failure", False))
+        when = job.get("when", "on_success")
+        # Job-level `when: manual` is optional (allow_failure defaults to true).
+        return when, bool(job.get("allow_failure", when == "manual"))
     rule = first_match(rules, env)
     if rule is None:
         return None
     when = rule.get("when", job.get("when", "on_success"))
     if when == "never":
         return None
-    # allow_failure: rule value, else job value, else false (inside rules, `manual` blocks).
-    return when, bool(rule.get("allow_failure", job.get("allow_failure", False)))
+    # allow_failure: rule value, else job value, else the default: true for a job-level
+    # `when: manual` (rule without its own `when`), false for `manual` set inside rules.
+    default = when == "manual" and "when" not in rule
+    return when, bool(rule.get("allow_failure", job.get("allow_failure", default)))
 
 
 def needs_names(job: dict) -> list[str]:

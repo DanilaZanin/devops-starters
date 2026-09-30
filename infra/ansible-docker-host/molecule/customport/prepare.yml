@@ -1,3 +1,14 @@
 ---
 - name: Prepare
   ansible.builtin.import_playbook: ../shared/prepare.yml
+
+# This scenario skips the docker tag, which is what replaces the stale docker apt
+# source from shared/prepare.yml; without this the apt cache refresh for ufw fails.
+- name: Drop the stale docker apt source (docker tag is skipped here)
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Remove the stale source
+      ansible.builtin.file:
+        path: /etc/apt/sources.list.d/docker.list
+        state: absent

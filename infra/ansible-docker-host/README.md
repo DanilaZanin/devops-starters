@@ -76,7 +76,9 @@ The role disables password login and does not check that a key is installed.
    generators, so the handler does `daemon-reload`, restarts `ssh.socket` and then `ssh`. A
    plain `systemctl restart ssh` does not re-run generators, so the old socket may stay. The `access` step covers
    both the working case (22.04 and 24.04, port 2222) and the failing one (a socket drop-in
-   pinned to port 22 that the generator cannot override).
+   pinned to port 22 that the generator cannot override, and a foreign process holding the new
+   port). An open port is not enough: the role also requires `ssh-keyscan` on that port to
+   return a host key of this machine, else it stops with `SSH_PORT_NOT_SSHD`.
 3. **Untrusted Docker apt key** (reproduced in tests). The key bundle is downloaded and its
    fingerprint compared with `docker_bootstrap_gpg_fingerprint`. apt's `signed-by` trusts
    every key in the file it points at, so a check that the expected fingerprint is present

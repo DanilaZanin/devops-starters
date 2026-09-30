@@ -59,6 +59,15 @@ def production_rule_can_fail(doc: dict) -> None:
     doc["apply:production"]["rules"][0]["allow_failure"] = True
 
 
+def production_manual_moved_to_job(doc: dict) -> None:
+    # Job-level `when: manual` without allow_failure is optional in GitLab
+    # (allow_failure defaults to true there, false for manual inside rules).
+    job = doc["apply:production"]
+    job["when"] = "manual"
+    del job["rules"][0]["when"]
+    del job["allow_failure"]
+
+
 def production_auto_rule_first(doc: dict) -> None:
     # First matching rule wins: the automatic rule shadows the manual one, even
     # though a `when: manual` still appears somewhere in the job.
@@ -110,6 +119,7 @@ PIPELINE_MUTATIONS = [
     (production_applies_automatically, "PROD_GATE"),
     (production_can_fail, "PROD_GATE"),
     (production_rule_can_fail, "PROD_GATE"),
+    (production_manual_moved_to_job, "PROD_GATE"),
     (production_auto_rule_first, "PROD_GATE"),
     (apply_bare_default_branch_variable, "APPLY_MAIN_ONLY"),
     (apply_not_equal_default_branch, "APPLY_MAIN_ONLY"),
