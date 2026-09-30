@@ -1,0 +1,23 @@
+---
+# The role is EXPECTED to stop. The failure text is stored for verify.yml; if
+# the role succeeds, "NONE" is stored and verify fails.
+- name: Converge (new ssh port never starts listening)
+  hosts: all
+  become: true
+  tasks:
+    - name: Run the role
+      block:
+        - name: Apply docker_bootstrap
+          ansible.builtin.import_role:
+            name: docker_bootstrap
+        - name: Record that the role did not stop
+          ansible.builtin.copy:
+            dest: /var/tmp/role-failure.txt
+            content: NONE
+            mode: "0644"
+      rescue:
+        - name: Record why the role stopped
+          ansible.builtin.copy:
+            dest: /var/tmp/role-failure.txt
+            content: "{{ ansible_failed_result.msg | default('unknown') }}"
+            mode: "0644"

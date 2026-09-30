@@ -51,29 +51,39 @@ live_pods() {
 }
 
 # Prints "recreated", "stale" or "unexpected: ..." for one chart.
+# It runs inside $(...), where bash switches errexit off. Every command whose
+# failure would otherwise look like "nothing happened" therefore ends in
+# `|| { echo "unexpected: ..."; return; }`, so a helm or kubectl failure can
+# never be scored as "stale".
 run_case() {
   local release=$1 chart=$2
   local ns="trap-$release" deploy="$release-demo-app"
   local pod_before pod_after env_before env_after cm_value
 
   helm upgrade --install "$release" "$chart" -n "$ns" --create-namespace \
-    --set env.APP_ENV=v1 --wait --timeout 180s >/dev/null
-  pod_before=$(live_pods "$ns" "$release")
-  env_before=$(kubectl -n "$ns" exec "$pod_before" -- printenv APP_ENV)
+    --set env.APP_ENV=v1 --wait --timeout 180s >/dev/null \
+    || { echo "unexpected: helm install failed"; return; }
+  pod_before=$(live_pods "$ns" "$release") || { echo "unexpected: cannot list pods before upgrade"; return; }
+  env_before=$(kubectl -n "$ns" exec "$pod_before" -- printenv APP_ENV) \
+    || { echo "unexpected: cannot read APP_ENV before upgrade"; return; }
 
   helm upgrade "$release" "$chart" -n "$ns" \
-    --set env.APP_ENV=v2 --wait --timeout 180s >/dev/null
+    --set env.APP_ENV=v2 --wait --timeout 180s >/dev/null \
+    || { echo "unexpected: helm upgrade failed"; return; }
   # Give a (wrongly) triggered rollout time to start, then wait for it to finish.
-  sleep 10
-  kubectl -n "$ns" rollout status "deploy/$deploy" --timeout=180s >/dev/null
+  sleep "${TRAP_SETTLE_SECONDS:-10}"
+  kubectl -n "$ns" rollout status "deploy/$deploy" --timeout=180s >/dev/null \
+    || { echo "unexpected: rollout did not finish"; return; }
 
-  cm_value=$(kubectl -n "$ns" get configmap "$deploy-env" -o jsonpath='{.data.APP_ENV}')
-  pod_after=$(live_pods "$ns" "$release")
+  cm_value=$(kubectl -n "$ns" get configmap "$deploy-env" -o jsonpath='{.data.APP_ENV}') \
+    || { echo "unexpected: cannot read the ConfigMap"; return; }
+  pod_after=$(live_pods "$ns" "$release") || { echo "unexpected: cannot list pods after upgrade"; return; }
   if [ "$(printf '%s\n' "$pod_after" | wc -l | tr -d ' ')" != 1 ]; then
     echo "unexpected: expected exactly one live pod, got: $pod_after"
     return
   fi
-  env_after=$(kubectl -n "$ns" exec "$pod_after" -- printenv APP_ENV)
+  env_after=$(kubectl -n "$ns" exec "$pod_after" -- printenv APP_ENV) \
+    || { echo "unexpected: cannot read APP_ENV after upgrade"; return; }
 
   if [ "$env_before" != v1 ] || [ "$cm_value" != v2 ]; then
     echo "unexpected: env_before=$env_before configmap_after=$cm_value"

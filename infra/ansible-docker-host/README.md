@@ -24,24 +24,28 @@ fails if any other file still wins.
 
 ```bash
 make check-prereqs   # docker, ansible-lint, molecule (with the docker driver)
-make test            # lint, then the trap (broken must fail), then the fixed role twice
+make test            # lint, trap (broken must fail), access, keytrust, then the fixed role twice
 ```
 
 `make test` prints `OK: broken hardening failed the sshd -T check as expected`
-after the trap step, then runs the full molecule sequence
+after the trap step. The `access` step proves an unreachable new ssh port cannot lock you
+out and that `ssh_port=2222` really moves the listener on 22.04 and 24.04; the `keytrust` step
+proves apt trusts only Docker's key. Then it runs the full molecule sequence
 (`create, prepare, converge, idempotence, verify, destroy`) for the fixed role on
 Ubuntu 22.04 and 24.04 containers. It exits non-zero if the broken variant
-passes, if it fails for any reason other than the sshd assertion, or if the
-fixed role is not idempotent.
+passes, if it fails for any reason other than the sshd assertion, if either extra
+step fails, or if the fixed role is not idempotent. Container names carry a suffix
+derived from the directory (`MOLECULE_RUN`), so two copies of the module can run
+against one Docker daemon.
 
 Other targets: `make up` (converge and keep the containers), `make down`,
 `make reset` (also deletes downloaded collections and logs).
 
 | | Status |
 |---|---|
-| macOS arm64 + colima (4 CPU / 8 GB) | verified 2026-09-29: `make test` green, also from a copied directory |
+| macOS arm64 + colima (4 CPU / 8 GB) | verified 2026-09-30: `make test` green (lockout, customport, keytrust, broken, default), also from a copied directory |
 | ubuntu-24.04 GitHub runner | CI only, not measured here; see the workflow `.github/workflows/ansible-docker-host.yml` |
-| First-run time | about 2.5 min with warm image cache, about 4.75 min on the very first run (image pulls and the Docker apt install dominate) |
+| First-run time | `make test` (trap, access, keytrust, fixed) measured 2026-09-30: 4 min 38 s in place and 5 min 17 s from a copied directory, both with the Ubuntu images already local; a cold machine adds the image pulls (not measured). The Docker apt install in the `default` scenario dominates |
 | RAM | peak about 2.2 GB used in the colima VM while two systemd containers ran (other containers were running too, so this is an upper bound) |
 
 Do not treat a green badge as more
@@ -62,14 +66,24 @@ The role disables password login and does not check that a key is installed.
 
 1. **sshd first-match plus the cloud-init drop-in** (reproduced in tests). Fix: a
    `00-hardening.conf` drop-in and an `sshd -T` assertion.
-2. **Firewall and sshd disagree about the port.** ufw always opens
-   `docker_bootstrap_ssh_port`, the same variable sshd is configured with. On
-   Ubuntu 24.04 with `ssh.socket` enabled, systemd ignores `Port` in sshd
-   config, so the role refuses a non-default port there instead of opening a port
-   nothing listens on. Not covered by the tests.
-3. **Untrusted Docker apt key.** The key is downloaded, its fingerprint is
-   compared with `docker_bootstrap_gpg_fingerprint`, and the file is removed if
-   it does not match. Not covered by the tests.
+2. **Firewall and sshd disagree about the port, or ufw closes the old one too early**
+   (reproduced in tests). The role hardens and restarts sshd first, then waits until
+   something listens on `docker_bootstrap_ssh_port`, and only then touches ufw. If the port
+   never comes up the play stops with `SSH_PORT_NOT_LISTENING` while ufw is untouched and the
+   old port still works. On Ubuntu 24.04 sshd is started by `ssh.socket`; its
+   `sshd-socket-generator` copies `Port` from the sshd config into
+   `/run/systemd/generator/ssh.socket.d/addresses.conf`, but only when systemd re-runs its
+   generators, so the handler does `daemon-reload`, restarts `ssh.socket` and then `ssh`. A
+   plain `systemctl restart ssh` does not re-run generators, so the old socket may stay. The `access` step covers
+   both the working case (22.04 and 24.04, port 2222) and the failing one (a socket drop-in
+   pinned to port 22 that the generator cannot override).
+3. **Untrusted Docker apt key** (reproduced in tests). The key bundle is downloaded and its
+   fingerprint compared with `docker_bootstrap_gpg_fingerprint`. apt's `signed-by` trusts
+   every key in the file it points at, so a check that the expected fingerprint is present
+   is not enough. The role exports only the verified key into `/etc/apt/keyrings/docker.gpg`,
+   points `signed-by` there, and removes the key files when verification fails. The `keytrust`
+   step feeds a bundle with Docker's real key plus a foreign key and requires a one-key
+   keyring, and requires a wrong fingerprint to be refused.
 4. **node_exporter on the wrong architecture or a bad download.** The tarball
    name is derived from `ansible_facts['architecture']` (amd64 or arm64) and the
    sha256 is taken from the release's `sha256sums.txt`. Not covered by the tests
@@ -85,6 +99,12 @@ Proves:
   `sshd -T` reporting `passwordauthentication yes` (broken fails), and the role
   leaves it at `no` (fixed passes), on Ubuntu 22.04 and 24.04.
 - The role converges twice with `changed=0` on the second run.
+- With `ssh_port=2222` the effective config, the actual listener (`ss`) and ufw all say
+  2222 and nothing listens on 22, on 22.04 (plain sshd) and 24.04 (`ssh.socket`).
+- When the new port never listens, the play stops before ufw is enabled and port 22 keeps
+  listening.
+- A key bundle with an extra key produces a keyring holding only Docker's key; a wrong
+  fingerprint is refused and leaves no key files.
 - After converge: root login off, `ufw` active with default deny incoming and
   the ssh port open, `docker` client installed, `node_exporter` answers on
   `127.0.0.1:9100`.
@@ -96,8 +116,10 @@ Does NOT prove:
   files in `sshd_config.d`.
 - A real password login is refused. The test reads sshd's effective
   configuration with `sshd -T`; it never opens a connection.
-- `ssh_port` other than 22, `ssh.socket` behaviour, or the fingerprint failure
-  path.
+- That a real remote login works on the new port through a real network path; the
+  listener and ufw rules are checked from inside the container.
+- Docker's real apt repository being usable with the exported keyring end to end is only
+  exercised by the default scenario's Docker install, not by `keytrust`.
 - `ufw` rules for ports published by Docker (see below). ufw inside a container
   also depends on the host kernel.
 - Docker daemon behaviour beyond installation. The daemon runs nested inside a
@@ -150,12 +172,14 @@ Version pins: Ubuntu base images `ubuntu:22.04` and `ubuntu:24.04`, node_exporte
 `1.12.1`. Ubuntu images are pinned by digest (build arg `BASE` in
 `molecule/*/molecule.yml`). Test tooling is pinned exactly in `requirements-dev.txt`
 (ansible-core 2.21.4, ansible-lint 26.9.0, molecule 26.9.0, molecule-plugins 26.9.28)
-and the collections in `requirements.yml` (community.general 13.4.0, community.docker 5.3.0).
+and the collections: `requirements.yml` holds the role's runtime dependency (community.general 13.4.0),
+`molecule/requirements.yml` adds the test-only community.docker 5.3.0 for the molecule docker driver.
 
 ## Copy it into your project
 
 Minimum: `roles/docker_bootstrap/`, `requirements.yml`, and a play that applies
-the role (`playbook.yml`). To keep the tests, also copy `molecule/`, `traps/`,
+the role (`playbook.yml`). To keep the tests, also copy `molecule/` (including
+`molecule/requirements.yml`, which the Makefile installs), `traps/`,
 `Makefile`, `requirements-dev.txt`, `.ansible-lint` and `ansible.cfg`. The
 module has no references outside its own directory.
 
@@ -168,5 +192,8 @@ roles/docker_bootstrap/         the role
 traps/broken_ssh_hardening.yml  the trap: the sshd_config edit that does not work
 molecule/default/               fixed role, with idempotence check
 molecule/broken/                trap: same fixture, broken hardening, verify must fail
+molecule/customport/            ssh_port=2222 on 22.04 and 24.04 (ssh.socket generator)
+molecule/lockout/               new port never listens: role must stop before ufw, 22 stays open
+molecule/keytrust/              key bundle with an extra key: apt keyring holds only Docker's key
 molecule/shared/                Dockerfile, cloud-init fixture, sshd -T check
 ```

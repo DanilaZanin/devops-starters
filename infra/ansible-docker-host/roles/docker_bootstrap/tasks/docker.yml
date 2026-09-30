@@ -1,7 +1,8 @@
 ---
 # Installs Docker Engine from the official repo, not the (usually stale)
 # distro package, and refuses to trust the repo key unless its fingerprint
-# matches docker_bootstrap_gpg_fingerprint.
+# matches docker_bootstrap_gpg_fingerprint,
+# and puts ONLY that key into the keyring that apt's signed-by points at.
 
 - name: Install prerequisite packages
   ansible.builtin.apt:
@@ -13,57 +14,14 @@
     update_cache: true
     cache_valid_time: 3600
 
-- name: Create keyrings dir
-  ansible.builtin.file:
-    path: /etc/apt/keyrings
-    state: directory
-    owner: root
-    group: root
-    mode: "0755"
-
-- name: Download and verify the Docker apt key
-  block:
-    - name: Download docker gpg key
-      ansible.builtin.get_url:
-        url: "{{ docker_bootstrap_gpg_key_url }}"
-        dest: /etc/apt/keyrings/docker.asc
-        owner: root
-        group: root
-        mode: "0644"
-
-    - name: Read the fingerprint of the downloaded key
-      ansible.builtin.command: gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc
-      register: docker_bootstrap_gpg_keys
-      changed_when: false
-      check_mode: false
-
-    - name: Check the key fingerprint
-      ansible.builtin.assert:
-        that:
-          - >-
-            ('fpr:::::::::' ~ docker_bootstrap_gpg_fingerprint ~ ':')
-            in docker_bootstrap_gpg_keys.stdout_lines
-        fail_msg: >-
-          /etc/apt/keyrings/docker.asc does not contain the expected fingerprint
-          {{ docker_bootstrap_gpg_fingerprint }}. Refusing to add the Docker repository.
-        quiet: true
-  rescue:
-    - name: Remove the untrusted key
-      ansible.builtin.file:
-        path: /etc/apt/keyrings/docker.asc
-        state: absent
-
-    - name: Stop because the Docker key could not be verified
-      ansible.builtin.fail:
-        msg: >-
-          Docker apt key verification failed; the key file was removed and the
-          Docker repository was not added.
+- name: Trust only the verified Docker apt key
+  ansible.builtin.import_tasks: docker_key.yml
 
 - name: Add docker apt repository
   ansible.builtin.apt_repository:
     repo: >-
       deb [arch={{ docker_bootstrap_arch_map[ansible_facts['architecture']] }}
-      signed-by=/etc/apt/keyrings/docker.asc]
+      signed-by={{ docker_bootstrap_keyring }}]
       https://download.docker.com/linux/ubuntu {{ ansible_facts['distribution_release'] }} stable
     filename: docker
     state: present

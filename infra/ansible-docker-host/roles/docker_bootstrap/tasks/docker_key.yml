@@ -1,0 +1,109 @@
+---
+# apt's signed-by trusts EVERY key in the file it points at. So verifying that
+# the expected fingerprint is somewhere in the download is not enough: a bundle
+# "real Docker key + another key" would pass. This file downloads the bundle,
+# checks the fingerprint, and exports only that key into a separate keyring.
+
+- name: Create keyrings dir
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Download and export the verified Docker apt key
+  block:
+    - name: Download the key bundle
+      ansible.builtin.get_url:
+        url: "{{ docker_bootstrap_gpg_key_url }}"
+        dest: /etc/apt/keyrings/docker.asc
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Read the fingerprints of the downloaded bundle
+      ansible.builtin.command: gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc
+      register: docker_bootstrap_gpg_keys
+      changed_when: false
+      check_mode: false
+
+    - name: Check the key fingerprint
+      ansible.builtin.assert:
+        that:
+          - >-
+            ('fpr:::::::::' ~ docker_bootstrap_gpg_fingerprint ~ ':')
+            in docker_bootstrap_gpg_keys.stdout_lines
+        fail_msg: >-
+          /etc/apt/keyrings/docker.asc does not contain the expected fingerprint
+          {{ docker_bootstrap_gpg_fingerprint }}. Refusing to add the Docker repository.
+        quiet: true
+
+    - name: Create a scratch gpg home
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: docker-gpg-
+      register: docker_bootstrap_gpg_home
+      changed_when: false
+      check_mode: false
+
+    - name: Export only the verified key
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          gpg --homedir "$GNUPGHOME" --batch --quiet --import /etc/apt/keyrings/docker.asc
+          gpg --homedir "$GNUPGHOME" --batch --export "$FPR" > "$GNUPGHOME/docker.gpg"
+          test -s "$GNUPGHOME/docker.gpg"
+        executable: /bin/bash
+      environment:
+        GNUPGHOME: "{{ docker_bootstrap_gpg_home.path }}"
+        FPR: "{{ docker_bootstrap_gpg_fingerprint }}"
+      changed_when: false
+      check_mode: false
+
+    - name: Install the single-key keyring for apt
+      ansible.builtin.copy:
+        src: "{{ docker_bootstrap_gpg_home.path }}/docker.gpg"
+        dest: "{{ docker_bootstrap_keyring }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Read the keyring apt will trust
+      ansible.builtin.command: gpg --show-keys --with-colons {{ docker_bootstrap_keyring }}
+      register: docker_bootstrap_keyring_keys
+      changed_when: false
+      check_mode: false
+
+    - name: The keyring holds exactly the verified key
+      ansible.builtin.assert:
+        that:
+          - docker_bootstrap_keyring_keys.stdout_lines | select('match', '^pub:') | list | length == 1
+          - (docker_bootstrap_keyring_keys.stdout_lines | select('match', '^fpr:') | list | first)
+            == ('fpr:::::::::' ~ docker_bootstrap_gpg_fingerprint ~ ':')
+        fail_msg: >-
+          {{ docker_bootstrap_keyring }} must contain only the key
+          {{ docker_bootstrap_gpg_fingerprint }}.
+        quiet: true
+  rescue:
+    - name: Remove the untrusted key material
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/keyrings/docker.asc
+        - "{{ docker_bootstrap_keyring }}"
+
+    - name: Stop because the Docker key could not be verified
+      ansible.builtin.fail:
+        msg: >-
+          Docker apt key verification failed; the key files were removed and the
+          Docker repository was not added.
+  always:
+    - name: Remove the scratch gpg home
+      ansible.builtin.file:
+        path: "{{ docker_bootstrap_gpg_home.path }}"
+        state: absent
+      when: docker_bootstrap_gpg_home.path | default('') != ''
+      changed_when: false

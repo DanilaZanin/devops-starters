@@ -1,25 +1,13 @@
 ---
-# Two Ubuntu targets with systemd, built from pinned base images.
+# Negative test: ssh.socket is pinned to port 22 (an admin customisation the
+# sshd socket generator cannot override), so the new port never starts listening.
+# The role must stop BEFORE ufw is touched and port 22 must keep working.
 dependency:
   name: galaxy
   enabled: false
 driver:
   name: docker
 platforms:
-  - name: ubuntu-2204-${MOLECULE_RUN:-local}
-    image: ubuntu:22.04
-    buildargs:
-      BASE: ubuntu:22.04@sha256:b8b6ee6aa931ecd9d0d952abc34dc0e5f7c6a30c6bb71b079fe399fde0329c02
-    dockerfile: ../shared/Dockerfile.j2
-    pre_build_image: false
-    command: /sbin/init
-    privileged: true
-    cgroupns_mode: host
-    volumes:
-      - /sys/fs/cgroup:/sys/fs/cgroup:rw
-    tmpfs:
-      - /run
-      - /run/lock
   - name: ubuntu-2404-${MOLECULE_RUN:-local}
     image: ubuntu:24.04
     buildargs:
@@ -36,6 +24,14 @@ platforms:
       - /run/lock
 provisioner:
   name: ansible
+  options:
+    skip-tags: docker,monitoring
+  inventory:
+    group_vars:
+      all:
+        docker_bootstrap_ssh_port: 2222
+        docker_bootstrap_ssh_listen_timeout: 5
+        docker_bootstrap_node_exporter_allowed_cidrs: []
   env:
     ANSIBLE_ROLES_PATH: "${MOLECULE_PROJECT_DIRECTORY}/roles"
     ANSIBLE_COLLECTIONS_PATH: "${MOLECULE_PROJECT_DIRECTORY}/.collections:~/.ansible/collections:/usr/share/ansible/collections"

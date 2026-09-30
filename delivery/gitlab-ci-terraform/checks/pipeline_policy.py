@@ -64,8 +64,152 @@ def image_parts(job: dict) -> tuple[str | None, object]:
     return None, None
 
 
-def rule_ifs(job: dict) -> list[str]:
-    return [str(r.get("if", "")) for r in job.get("rules", []) if r.get("when") != "never"]
+class UnsupportedRule(ValueError):
+    """A rules:if expression this checker cannot evaluate. The policy fails closed."""
+
+
+_TOKEN = re.compile(r'\s*(?:(\$[A-Za-z_][A-Za-z0-9_]*)|"([^"]*)"|\'([^\']*)\'|(==|!=|&&|\|\||\(|\)))')
+
+
+def _tokenize(expr: str) -> list[tuple[str, str]]:
+    tokens, pos = [], 0
+    while pos < len(expr):
+        if not expr[pos:].strip():
+            break
+        m = _TOKEN.match(expr, pos)
+        if not m:
+            raise UnsupportedRule(f"cannot evaluate `{expr}` (unsupported syntax near `{expr[pos:].strip()[:20]}`)")
+        var, dq, sq, op = m.groups()
+        if var:
+            tokens.append(("var", var[1:]))
+        elif dq is not None or sq is not None:
+            tokens.append(("str", dq if dq is not None else sq))
+        else:
+            tokens.append(("op", op))
+        pos = m.end()
+    return tokens
+
+
+def eval_if(expr: str, env: dict[str, str]) -> bool:
+    """Evaluate a GitLab `rules:if` expression against variables `env`.
+
+    Supports $VAR, "literal", ==, !=, &&, || and parentheses. A bare `$VAR` is
+    true when the variable is set and not empty; an unset variable compares as
+    an empty string. Anything else (regex matches, ...) raises UnsupportedRule.
+    """
+    tokens = _tokenize(expr)
+    pos = 0
+
+    def peek() -> tuple[str, str] | None:
+        return tokens[pos] if pos < len(tokens) else None
+
+    def take() -> tuple[str, str]:
+        nonlocal pos
+        tok = peek()
+        if tok is None:
+            raise UnsupportedRule(f"cannot evaluate `{expr}` (unexpected end)")
+        pos += 1
+        return tok
+
+    def value(tok: tuple[str, str]) -> str:
+        return env.get(tok[1], "") if tok[0] == "var" else tok[1]
+
+    def primary() -> bool:
+        tok = take()
+        if tok == ("op", "("):
+            result = disjunction()
+            if take() != ("op", ")"):
+                raise UnsupportedRule(f"cannot evaluate `{expr}` (missing `)`)")
+            return result
+        if tok[0] == "op":
+            raise UnsupportedRule(f"cannot evaluate `{expr}` (unexpected `{tok[1]}`)")
+        nxt = peek()
+        if nxt in {("op", "=="), ("op", "!=")}:
+            take()
+            rhs = take()
+            if rhs[0] == "op":
+                raise UnsupportedRule(f"cannot evaluate `{expr}`")
+            same = value(tok) == value(rhs)
+            return same if nxt[1] == "==" else not same
+        return value(tok) != ""
+
+    def conjunction() -> bool:
+        result = primary()
+        while peek() == ("op", "&&"):
+            take()
+            result = primary() and result
+        return result
+
+    def disjunction() -> bool:
+        result = conjunction()
+        while peek() == ("op", "||"):
+            take()
+            result = conjunction() or result
+        return result
+
+    result = disjunction()
+    if pos != len(tokens):
+        raise UnsupportedRule(f"cannot evaluate `{expr}` (trailing tokens)")
+    return result
+
+
+# The pipelines that matter, described by the predefined variables GitLab sets.
+CONTEXTS: dict[str, dict[str, str]] = {
+    "merge request": {
+        "CI_PIPELINE_SOURCE": "merge_request_event",
+        "CI_MERGE_REQUEST_IID": "7",
+        "CI_DEFAULT_BRANCH": "main",
+    },
+    "default branch": {
+        "CI_PIPELINE_SOURCE": "push",
+        "CI_COMMIT_BRANCH": "main",
+        "CI_DEFAULT_BRANCH": "main",
+    },
+    "feature branch with an open MR": {
+        "CI_PIPELINE_SOURCE": "push",
+        "CI_COMMIT_BRANCH": "feature",
+        "CI_OPEN_MERGE_REQUESTS": "group/project!7",
+        "CI_DEFAULT_BRANCH": "main",
+    },
+    "feature branch without an MR": {
+        "CI_PIPELINE_SOURCE": "push",
+        "CI_COMMIT_BRANCH": "feature",
+        "CI_DEFAULT_BRANCH": "main",
+    },
+}
+
+
+def first_match(rules: list[dict], env: dict[str, str]) -> dict | None:
+    """The first rule whose `if` holds (a rule without `if` always matches), like GitLab."""
+    for rule in rules:
+        if "if" not in rule or eval_if(str(rule["if"]), env):
+            return rule
+    return None
+
+
+def pipeline_runs(doc: dict, env: dict[str, str]) -> bool:
+    rules = doc.get("workflow", {}).get("rules")
+    if not rules:
+        return True
+    rule = first_match(rules, env)
+    return rule is not None and rule.get("when") != "never"
+
+
+def outcome(doc: dict, job: dict, env: dict[str, str]) -> tuple[str, bool] | None:
+    """(when, allow_failure) of the job in this pipeline, or None when it is not created."""
+    if not pipeline_runs(doc, env):
+        return None
+    rules = job.get("rules")
+    if not rules:
+        return job.get("when", "on_success"), bool(job.get("allow_failure", False))
+    rule = first_match(rules, env)
+    if rule is None:
+        return None
+    when = rule.get("when", job.get("when", "on_success"))
+    if when == "never":
+        return None
+    # allow_failure: rule value, else job value, else false (inside rules, `manual` blocks).
+    return when, bool(rule.get("allow_failure", job.get("allow_failure", False)))
 
 
 def needs_names(job: dict) -> list[str]:
@@ -114,39 +258,42 @@ def check(root: Path, ci_file: Path | None = None) -> list[tuple[str, str]]:
         if image and SELF_ENTRYPOINT_IMAGES.search(image) and entrypoint != [""]:
             add("TF_ENTRYPOINT", f"{name}: image {image} needs `entrypoint: [\"\"]`")
 
-    # 2. Plans run in merge requests and on the default branch.
+    # 2-6. Rules are evaluated per pipeline type with first-match semantics,
+    # not searched for substrings.
+    #   plan:*   run automatically in merge requests and on the default branch
+    #   apply:*  exist only on the default branch, need the matching plan and a
+    #            resource_group; production is a manual, blocking gate
     for name, job in visible.items():
-        if name.startswith("plan:"):
-            ifs = rule_ifs(job)
-            if not any("merge_request_event" in c for c in ifs):
-                add("PLAN_RULES", f"{name}: no rule for merge request pipelines")
-            if not any("CI_DEFAULT_BRANCH" in c for c in ifs):
-                add("PLAN_RULES", f"{name}: no rule for the default branch")
-
-    # 3-6. Applies: default branch only, need the matching plan, serialized;
-    # production is a manual, blocking gate.
-    for name, job in visible.items():
-        if not name.startswith("apply:"):
+        if not name.startswith(("plan:", "apply:")):
             continue
-        env = name.split(":", 1)[1]
-        ifs = rule_ifs(job)
-        if not job.get("rules"):
-            add("APPLY_MAIN_ONLY", f"{name}: no rules, so it would run wherever the workflow runs")
-        if any("merge_request_event" in c for c in ifs) or (
-            job.get("rules") and not all("CI_DEFAULT_BRANCH" in c for c in ifs)
-        ):
-            add("APPLY_MAIN_ONLY", f"{name}: rules allow apply outside the default branch")
-        if f"plan:{env}" not in needs_names(job):
-            add("APPLY_NEEDS_PLAN", f"{name}: must list plan:{env} in needs")
+        kind, env_name = name.split(":", 1)
+        try:
+            results = {ctx: outcome(doc, job, variables) for ctx, variables in CONTEXTS.items()}
+        except UnsupportedRule as exc:
+            add("RULE_UNSUPPORTED", f"{name}: {exc}")
+            continue
+        if kind == "plan":
+            for ctx in ("merge request", "default branch"):
+                if results[ctx] is None or results[ctx][0] != "on_success":
+                    add("PLAN_RULES", f"{name}: must run automatically in a {ctx} pipeline")
+            continue
+        for ctx, result in results.items():
+            if ctx != "default branch" and result is not None:
+                add("APPLY_MAIN_ONLY", f"{name}: would be created in a {ctx} pipeline")
+        if results["default branch"] is None:
+            add("APPLY_MAIN_ONLY", f"{name}: is never created on the default branch")
+        if f"plan:{env_name}" not in needs_names(job):
+            add("APPLY_NEEDS_PLAN", f"{name}: must list plan:{env_name} in needs")
         if not job.get("resource_group"):
             add("RESOURCE_GROUP", f"{name}: missing resource_group (concurrent applies)")
-        if env == "production":
-            rules = job.get("rules", [])
-            manual = any(r.get("when") == "manual" for r in rules) or (
-                job.get("when") == "manual" and any("when" not in r for r in rules)
-            )
-            if not manual or job.get("allow_failure") is not False:
-                add("PROD_GATE", f"{name}: must be `when: manual` with `allow_failure: false`")
+        if env_name == "production" and results["default branch"] is not None:
+            when, allow_failure = results["default branch"]
+            if when != "manual" or allow_failure:
+                add(
+                    "PROD_GATE",
+                    f"{name}: on the default branch it resolves to when={when}, "
+                    f"allow_failure={str(allow_failure).lower()}; needs manual and false",
+                )
 
     # 7. The image is pushed to the project registry.
     build = visible.get("build")

@@ -51,7 +51,35 @@ def production_applies_automatically(doc: dict) -> None:
 
 
 def production_can_fail(doc: dict) -> None:
-    del doc["apply:production"]["allow_failure"]
+    doc["apply:production"]["allow_failure"] = True
+
+
+def production_rule_can_fail(doc: dict) -> None:
+    # Rule-level allow_failure overrides the job-level one.
+    doc["apply:production"]["rules"][0]["allow_failure"] = True
+
+
+def production_auto_rule_first(doc: dict) -> None:
+    # First matching rule wins: the automatic rule shadows the manual one, even
+    # though a `when: manual` still appears somewhere in the job.
+    doc["apply:production"]["rules"] = [
+        {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"},
+        {"if": "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH", "when": "manual"},
+    ]
+
+
+def apply_bare_default_branch_variable(doc: dict) -> None:
+    # `$CI_DEFAULT_BRANCH` alone is truthy in every pipeline, merge requests included.
+    doc["apply:staging"]["rules"] = [{"if": "$CI_DEFAULT_BRANCH"}]
+
+
+def apply_not_equal_default_branch(doc: dict) -> None:
+    doc["apply:staging"]["rules"] = [{"if": "$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH"}]
+
+
+def apply_uses_unsupported_expression(doc: dict) -> None:
+    # A regex match cannot be evaluated here; the policy must fail closed.
+    doc["apply:staging"]["rules"] = [{"if": "$CI_COMMIT_BRANCH =~ /^main$/"}]
 
 
 def apply_without_resource_group(doc: dict) -> None:
@@ -81,6 +109,11 @@ PIPELINE_MUTATIONS = [
     (plan_only_on_default_branch, "PLAN_RULES"),
     (production_applies_automatically, "PROD_GATE"),
     (production_can_fail, "PROD_GATE"),
+    (production_rule_can_fail, "PROD_GATE"),
+    (production_auto_rule_first, "PROD_GATE"),
+    (apply_bare_default_branch_variable, "APPLY_MAIN_ONLY"),
+    (apply_not_equal_default_branch, "APPLY_MAIN_ONLY"),
+    (apply_uses_unsupported_expression, "RULE_UNSUPPORTED"),
     (apply_without_resource_group, "RESOURCE_GROUP"),
     (apply_without_plan, "APPLY_NEEDS_PLAN"),
     (build_without_push, "REGISTRY_PUSH"),

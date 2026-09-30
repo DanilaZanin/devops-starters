@@ -12,17 +12,21 @@ export DOCKER_HOST := $(DOCKER_CONTEXT_HOST)
 endif
 endif
 
+# Container names get a suffix derived from this directory, so two copies of
+# the module (or two CI jobs sharing a docker daemon) do not collide.
+export MOLECULE_RUN ?= $(shell printf '%s' '$(CURDIR)' | cksum | cut -d' ' -f1)
+
 export ANSIBLE_NOCOLOR := 1
 export PY_COLORS := 0
 
 TRAP_LOG := .trap-broken.log
 COLLECTIONS_STAMP := .collections/.installed
 
-.PHONY: help check-prereqs deps lint trap fixed test up down reset
+.PHONY: help check-prereqs deps lint trap access keytrust fixed test up down reset
 
 help:
 	@echo "make check-prereqs  verify the tools are installed and docker is reachable"
-	@echo "make test           lint + trap (broken must fail) + fixed (must pass, idempotent)"
+	@echo "make test           lint + trap (broken must fail) + access + keytrust + fixed (must pass, idempotent)"
 	@echo "make up             converge the fixed role on two Ubuntu containers and keep them"
 	@echo "make down           destroy the containers"
 	@echo "make reset          destroy containers and delete downloaded collections and logs"
@@ -64,19 +68,36 @@ trap: check-prereqs deps
 	fi; \
 	echo "OK: broken hardening failed the sshd -T check as expected"
 
+# Access-preservation: with ssh_port=2222 and a listener that never moves, the
+# role must stop before ufw is enabled and port 22 must keep working.
+access: check-prereqs deps
+	@echo ">> access: an unreachable new ssh port must not close port 22"
+	molecule test -s lockout
+	@echo ">> access: a working non-default ssh port (22.04 plain sshd, 24.04 ssh.socket)"
+	molecule test -s customport
+
+# Key trust: a bundle with Docker's key plus a foreign key must yield a keyring
+# holding ONLY Docker's key; a wrong fingerprint must be refused.
+keytrust: check-prereqs deps
+	@echo ">> keytrust: apt must trust only the verified Docker key"
+	molecule test -s keytrust
+
 fixed: check-prereqs deps
 	@echo ">> fixed: role must pass, twice (idempotence), on Ubuntu 22.04 and 24.04"
 	molecule test -s default
 
-test: check-prereqs lint trap fixed
+test: check-prereqs lint trap access keytrust fixed
 
 up: check-prereqs deps
 	molecule converge -s default
-	@echo "log in with: molecule login -s default -h ubuntu-2204"
+	@echo "log in with: molecule login -s default -h ubuntu-2204-$(MOLECULE_RUN)"
 
 down:
 	-molecule destroy -s default
 	-molecule destroy -s broken
+	-molecule destroy -s lockout
+	-molecule destroy -s customport
+	-molecule destroy -s keytrust
 
 reset: down
 	rm -rf .collections $(TRAP_LOG)

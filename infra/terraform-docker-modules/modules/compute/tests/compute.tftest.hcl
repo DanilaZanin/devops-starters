@@ -69,3 +69,67 @@ run "zero_replicas_is_rejected" {
 
   expect_failures = [var.replicas]
 }
+
+# Offsetting by replica index is not enough across several rules: with rules on
+# 8080 and 8081 and two replicas, replica 0 publishes [8080, 8081] and replica 1
+# publishes [8081, 8082], and 8081 is claimed twice.
+run "adjacent_rules_that_collide_across_replicas_are_rejected" {
+  command = plan
+
+  variables {
+    replicas = 2
+    security_group_rules = [
+      { description = "app", internal = 8080, external = 8080, protocol = "tcp" },
+      { description = "admin", internal = 9090, external = 8081, protocol = "tcp" },
+    ]
+  }
+
+  expect_failures = [docker_container.this]
+}
+
+run "rules_spaced_by_at_least_the_replica_count_are_accepted" {
+  command = plan
+
+  variables {
+    replicas = 2
+    security_group_rules = [
+      { description = "app", internal = 8080, external = 8080, protocol = "tcp" },
+      { description = "admin", internal = 9090, external = 8082, protocol = "tcp" },
+    ]
+  }
+
+  assert {
+    condition     = flatten([for ports in output.published_ports : [for p in ports : p.external]]) == [8080, 8082, 8081, 8083]
+    error_message = "two replicas and two spaced rules must publish four distinct host ports"
+  }
+}
+
+run "the_same_port_on_tcp_and_udp_is_not_a_collision" {
+  command = plan
+
+  variables {
+    replicas = 2
+    security_group_rules = [
+      { description = "dns tcp", internal = 53, external = 5353, protocol = "tcp" },
+      { description = "dns udp", internal = 53, external = 5353, protocol = "udp" },
+    ]
+  }
+
+  assert {
+    condition     = length(flatten(output.published_ports)) == 4
+    error_message = "tcp and udp on the same number are separate host ports"
+  }
+}
+
+run "ports_beyond_65535_are_rejected" {
+  command = plan
+
+  variables {
+    replicas = 3
+    security_group_rules = [
+      { description = "edge", internal = 80, external = 65534, protocol = "tcp" },
+    ]
+  }
+
+  expect_failures = [docker_container.this]
+}

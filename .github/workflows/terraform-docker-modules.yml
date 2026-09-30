@@ -26,14 +26,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: hashicorp/setup-terraform@v4
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: "1.16.4"
           terraform_wrapper: false
 
-      - uses: terraform-linters/setup-tflint@v6
+      - uses: terraform-linters/setup-tflint@1cf010d3c7aef302051ccdb68c14c5dc2efa34ef # v6.3.1
         with:
           tflint_version: v0.64.0
 
@@ -52,16 +52,19 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: hashicorp/setup-terraform@v4
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: "1.16.4"
           terraform_wrapper: false
 
-      - name: copy-test (make up and down in a copy of the module)
+      - name: copy-test (make up in a copy of the module; fails unless every URL answers 200)
         run: |
           dest="$RUNNER_TEMP/terraform-docker-modules"
           cp -r infra/terraform-docker-modules "$dest"
           make -C "$dest" up
-          make -C "$dest" down
+
+      - name: Destroy the example
+        if: always()
+        run: make -C "$RUNNER_TEMP/terraform-docker-modules" down || true

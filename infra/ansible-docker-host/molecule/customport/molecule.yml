@@ -1,5 +1,6 @@
 ---
-# Two Ubuntu targets with systemd, built from pinned base images.
+# ssh_port=2222 on 22.04 (plain sshd) and 24.04 (ssh.socket). Docker and node_exporter
+# are skipped; this scenario is about ssh + ufw only.
 dependency:
   name: galaxy
   enabled: false
@@ -36,6 +37,13 @@ platforms:
       - /run/lock
 provisioner:
   name: ansible
+  options:
+    skip-tags: docker,monitoring
+  inventory:
+    group_vars:
+      all:
+        docker_bootstrap_ssh_port: 2222
+        docker_bootstrap_node_exporter_allowed_cidrs: []
   env:
     ANSIBLE_ROLES_PATH: "${MOLECULE_PROJECT_DIRECTORY}/roles"
     ANSIBLE_COLLECTIONS_PATH: "${MOLECULE_PROJECT_DIRECTORY}/.collections:~/.ansible/collections:/usr/share/ansible/collections"
@@ -47,5 +55,6 @@ scenario:
     - create
     - prepare
     - converge
+    - idempotence
     - verify
     - destroy

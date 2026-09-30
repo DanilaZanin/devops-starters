@@ -1,0 +1,29 @@
+---
+- name: Verify the non-default ssh port really listens
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Read the effective sshd configuration
+      ansible.builtin.command: /usr/sbin/sshd -T
+      register: sshd_effective
+      changed_when: false
+
+    - name: List listening tcp sockets
+      ansible.builtin.command: ss -Hltn
+      register: listeners
+      changed_when: false
+
+    - name: Read ufw status
+      ansible.builtin.command: ufw status verbose
+      register: ufw_status
+      changed_when: false
+
+    - name: The sshd config, the listener and ufw all agree on 2222
+      ansible.builtin.assert:
+        that:
+          - "'port 2222' in sshd_effective.stdout_lines"
+          - listeners.stdout_lines | select('search', ':2222\\s') | list | length > 0
+          - listeners.stdout_lines | select('search', ':22\\s') | list | length == 0
+          - "'Status: active' in ufw_status.stdout"
+          - "'2222/tcp' in ufw_status.stdout"
+        quiet: true

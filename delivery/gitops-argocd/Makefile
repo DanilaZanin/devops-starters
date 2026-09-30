@@ -20,12 +20,12 @@ CHART := charts/demo-app
 IMAGE_REF := $(shell awk '/^  repository:/{r=$$2} /^  tag:/{gsub(/"/,"",$$2); t=$$2} END{print r":"t}' $(CHART)/values.yaml)
 ENVS := staging production
 
-.PHONY: help check-prereqs lint cluster-up cluster-down trap test up down reset
+.PHONY: help check-prereqs lint cluster-up cluster-down trap-guard trap test up down reset
 
 help:
 	@echo "make check-prereqs  verify the tools are installed and docker is reachable"
 	@echo "make lint           helm lint, kubeconform (strict, with Argo CRD schemas), repoURL check"
-	@echo "make test           lint + trap on a throwaway kind cluster (deleted afterwards)"
+	@echo "make test           lint + trap on a throwaway kind cluster (deleted afterwards), after a stub-based guard of the trap script itself"
 	@echo "make up             kind cluster with the staging release installed, kept for poking"
 	@echo "make down           delete the kind cluster"
 	@echo "make reset          down + remove the private kubeconfig"
@@ -81,7 +81,10 @@ cluster-down:
 
 # The trap: a broken chart (no checksum/config) must leave the pod stale after
 # `helm upgrade`, the shipped chart must recreate it. See traps/configmap-rollout.sh.
-trap: cluster-up
+trap-guard:
+	./traps/guard-test.sh
+
+trap: trap-guard cluster-up
 	./traps/configmap-rollout.sh
 
 test: check-prereqs lint

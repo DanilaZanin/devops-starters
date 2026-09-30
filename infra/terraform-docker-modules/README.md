@@ -19,6 +19,12 @@ The `compute` module computes the published ports in one `locals` block and offs
 host port by the replica index (8080, 8081, ...). Its tests assert the planned ports, so
 the mistake shows up in `terraform test` in seconds, without a Docker daemon.
 
+The offset only separates replicas of the same rule. With two replicas and rules on 8080
+and 8081, replica 0 publishes 8080 and 8081 and replica 1 publishes 8081 and 8082, so 8081
+is claimed twice. The module therefore checks the whole computed set and refuses to plan
+when any (ip, protocol, host port) appears more than once, or a port exceeds 65535.
+Space rules at least `replicas` apart.
+
 ## Quick start
 
 ```bash
@@ -37,7 +43,8 @@ OK: without the offset, terraform test fails on 'replicas must publish distinct 
 ```
 
 `make up` applies `examples/docker-sandbox` on your local Docker (two nginx containers on
-127.0.0.1:8080 and :8081) and curls them; `make down` destroys them; `make reset` also
+127.0.0.1:8080 and :8081) and requires each URL to answer HTTP 200 (15 tries, 2 s apart, then
+non-zero exit); `make down` destroys them; `make reset` also
 removes `.terraform` directories and local state.
 
 | | Status |
@@ -51,7 +58,8 @@ removes `.terraform` directories and local state.
 
 1. **Replicas collide on the host port** (reproduced in tests). One `locals` block feeds
    both the containers and the `published_ports` output, with the replica index added
-   to the external port.
+   to the external port, and a precondition rejects rules whose offset ranges overlap
+   (8080 and 8081 with two replicas) or leave the port range.
 2. **Silently ignored inputs.** Docker cannot filter published ports by source
    address, so the security-group module rejects any `cidr` other than `0.0.0.0/0`
    instead of accepting a value that does nothing.
@@ -70,6 +78,11 @@ Proves:
 - With a mocked provider, the compute module plans distinct host ports and indexed
   names for N replicas, keeps the plain name and port for one, and defaults to
   loopback. A copy without the offset fails those assertions.
+- Rules on adjacent ports (8080 and 8081, two replicas) are rejected at plan time, rules
+  spaced by the replica count are accepted, tcp and udp on one number do not collide, and
+  ports above 65535 are rejected.
+- `make check-urls` (used by `make up`) fails on a closed port and passes on an answering
+  server (`make urls-guard`, part of `make test`).
 - The validations in all three modules reject bad input (`expect_failures`).
 - The example wires the modules into two replicas on `127.0.0.1:8080` and `:8081`.
 - Code is formatted and validates against the real provider schema.

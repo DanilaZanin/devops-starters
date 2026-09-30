@@ -81,7 +81,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: demo-app
-          image: python:3.14-alpine
+          image: python:3.14.7-alpine
           command: ["python", "/app/server.py"]
           ports:
             - name: http

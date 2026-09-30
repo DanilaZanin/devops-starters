@@ -5,7 +5,19 @@
     state: restarted
     daemon_reload: true
 
-- name: Restart sshd
+# Two handlers on one topic. With socket activation, systemd must re-run the
+# sshd socket generator (daemon_reload) and restart ssh.socket for a changed
+# Port to take effect; then ssh.service is restarted to drop the old process.
+- name: Reload systemd and restart ssh.socket
   ansible.builtin.systemd_service:
-    name: ssh
+    name: ssh.socket
     state: restarted
+    daemon_reload: true
+  when: (docker_bootstrap_ssh_socket.status.ActiveState | default('')) == 'active'
+  listen: Restart sshd
+
+- name: Restart ssh.service
+  ansible.builtin.systemd_service:
+    name: ssh.service
+    state: restarted
+  listen: Restart sshd

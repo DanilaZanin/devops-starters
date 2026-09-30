@@ -5,21 +5,16 @@
 # `PasswordAuthentication yes`, so editing sshd_config itself does nothing.
 # Files in the directory are read in lexical order: 00-hardening.conf wins.
 
-- name: Check whether ssh.socket activation is enabled (Ubuntu 24.04)
-  ansible.builtin.stat:
-    path: /etc/systemd/system/sockets.target.wants/ssh.socket
+# Ubuntu 24.04 starts sshd through ssh.socket. Its sshd-socket-generator turns
+# `Port` from sshd_config(.d) into /run/systemd/generator/ssh.socket.d/addresses.conf,
+# but only when systemd re-runs generators (daemon-reload) and ssh.socket is
+# restarted. A plain `restart ssh` keeps the old listener.
+- name: Check whether ssh.socket activation is in use
+  ansible.builtin.systemd_service:
+    name: ssh.socket
   register: docker_bootstrap_ssh_socket
-
-- name: Refuse a non-default ssh port when ssh.socket would ignore it
-  ansible.builtin.assert:
-    that:
-      - docker_bootstrap_ssh_port | int == 22 or not docker_bootstrap_ssh_socket.stat.exists
-    fail_msg: >-
-      ssh.socket is enabled, so systemd (not sshd_config) decides which port sshd listens on
-      and docker_bootstrap_ssh_port={{ docker_bootstrap_ssh_port }} would be ignored while ufw
-      opened it. Disable socket activation first (systemctl disable --now ssh.socket; systemctl
-      enable --now ssh.service) or keep the port at 22.
-    quiet: true
+  failed_when: false
+  check_mode: false
 
 - name: Create the sshd privilege separation directory (sshd -t needs it)
   ansible.builtin.file:
@@ -61,3 +56,19 @@
       Include) overrides {{ docker_bootstrap_ssh_dropin_name }}; inspect
       /etc/ssh/sshd_config.d/ and the top of /etc/ssh/sshd_config.
     quiet: true
+
+# Apply the restart now and prove the listener moved BEFORE the firewall role
+# part runs. If it did not, stop here: ufw is untouched and the old port works.
+- name: Apply pending sshd changes now
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for sshd to listen on the configured port
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ docker_bootstrap_ssh_port | int }}"
+    timeout: "{{ docker_bootstrap_ssh_listen_timeout | int }}"
+    msg: >-
+      SSH_PORT_NOT_LISTENING: nothing listens on port {{ docker_bootstrap_ssh_port }} after
+      the sshd change. ufw was not modified, so the previous ssh port still works. If
+      ssh.socket is customised (ListenStream in /etc/systemd/system/ssh.socket.d), align it
+      with docker_bootstrap_ssh_port or disable socket activation.

@@ -16,11 +16,11 @@ export DOCKER_HOST := $(DOCKER_CONTEXT_HOST)
 endif
 endif
 
-.PHONY: help check-prereqs fmt lint validate unit trap test up down reset
+.PHONY: help check-prereqs fmt lint validate unit trap urls-guard check-urls test up down reset
 
 help:
 	@echo "make check-prereqs  verify terraform (>= 1.7) is installed"
-	@echo "make test           fmt, validate, terraform test for every module, trap (broken must fail)"
+	@echo "make test           fmt, validate, terraform test for every module, trap (broken must fail), URL-check guard"
 	@echo "make up             apply examples/docker-sandbox on your local docker (2 nginx containers)"
 	@echo "make down           destroy it"
 	@echo "make reset          down + remove .terraform directories and local state"
@@ -63,14 +63,43 @@ unit:
 trap:
 	./traps/port-offset.sh
 
-test: check-prereqs fmt lint validate unit trap
+test: check-prereqs fmt lint validate unit trap urls-guard
+
+# Each URL is polled up to URL_RETRIES times, URL_DELAY seconds apart, and must
+# answer HTTP 200. Any URL that does not makes the target fail.
+URL_RETRIES ?= 15
+URL_DELAY ?= 2
+
+# usage: make check-urls URLS="http://127.0.0.1:8080 http://127.0.0.1:8081"
+check-urls:
+	@if [ -z "$(strip $(URLS))" ]; then echo "FAIL: no URLs to check"; exit 1; fi
+	@for url in $(URLS); do \
+	  code=000; \
+	  for i in $$(seq 1 $(URL_RETRIES)); do \
+	    code=$$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$$url" || true); \
+	    [ "$$code" = 200 ] && break; \
+	    sleep $(URL_DELAY); \
+	  done; \
+	  if [ "$$code" != 200 ]; then echo "FAIL: $$url answered HTTP $$code after $(URL_RETRIES) tries"; exit 1; fi; \
+	  echo "$$url answers HTTP 200"; \
+	done
+
+# The URL check itself must fail on a closed port and pass on an answering one,
+# otherwise `make up` could be green with no working HTTP.
+urls-guard:
+	@if $(MAKE) --no-print-directory check-urls URLS=http://127.0.0.1:9/ URL_RETRIES=2 URL_DELAY=0 >/dev/null 2>&1; then \
+	  echo "GUARD FAILED: check-urls passed for a closed port"; exit 1; fi
+	@dir=$$(mktemp -d); port=$$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'); \
+	python3 -m http.server $$port --bind 127.0.0.1 --directory $$dir >/dev/null 2>&1 & pid=$$!; \
+	rc=0; $(MAKE) --no-print-directory check-urls URLS=http://127.0.0.1:$$port/ URL_RETRIES=10 URL_DELAY=1 >/dev/null 2>&1 || rc=$$?; \
+	{ kill $$pid; wait $$pid; } 2>/dev/null; rm -rf $$dir; \
+	if [ $$rc -ne 0 ]; then echo "GUARD FAILED: check-urls failed for an answering server"; exit 1; fi
+	@echo "OK: check-urls fails on a closed port and passes on an answering one"
 
 up: check-prereqs
 	terraform -chdir=$(EXAMPLE) init -input=false
 	terraform -chdir=$(EXAMPLE) apply -input=false -auto-approve
-	@for url in $$(terraform -chdir=$(EXAMPLE) output -json urls | tr -d '[]"' | tr ',' ' '); do \
-	  echo "$$url"; curl -fsSI "$$url" | head -1 || echo "  not answering yet"; \
-	done
+	@$(MAKE) --no-print-directory check-urls URLS="$$(terraform -chdir=$(EXAMPLE) output -json urls | tr -d '[]"' | tr ',' ' ')"
 
 down:
 	-terraform -chdir=$(EXAMPLE) destroy -input=false -auto-approve

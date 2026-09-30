@@ -1,4 +1,4 @@
-FROM python:3.14-slim
+FROM python:3.14.7-slim
 
 RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin app
 

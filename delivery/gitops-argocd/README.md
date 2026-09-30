@@ -74,6 +74,9 @@ Proves:
   ConfigMap changed, and the shipped chart replaces the pod with one that has the
   new value. The broken chart is generated from the shipped one by deleting that
   single annotation line, so the two cannot drift apart.
+- A failure unrelated to the ConfigMap cannot pass as the trap: `traps/guard-test.sh`
+  runs the trap script with a `helm` stub that exits 42 and requires a non-zero exit
+  with no case scored as "stale" (part of `make test`, needs no cluster).
 - Rendered manifests validate against the Kubernetes and ArgoCD schemas
   (`kubeconform -strict`), and every Application uses the same `repoURL`.
 
@@ -120,7 +123,7 @@ To promote: tag a commit that ran in staging, change `targetRevision` in
 
 The directory is self-contained: `charts/`, `environments/`, `apps/`,
 `bootstrap/`, `scripts/`, `traps/`, `Makefile`. Copy the chart and the manifests
-you need; keep `traps/configmap-rollout.sh` if you want the regression test for
+you need; keep `traps/configmap-rollout.sh` and `traps/guard-test.sh` if you want the regression test for
 your own chart (it expects `charts/demo-app` and the `demo-app.fullname` naming).
 
 ## Layout

@@ -6,7 +6,7 @@ dependency:
 driver:
   name: docker
 platforms:
-  - name: ubuntu-2204
+  - name: ubuntu-2204-${MOLECULE_RUN:-local}
     image: ubuntu:22.04
     buildargs:
       BASE: ubuntu:22.04@sha256:b8b6ee6aa931ecd9d0d952abc34dc0e5f7c6a30c6bb71b079fe399fde0329c02
@@ -20,7 +20,7 @@ platforms:
     tmpfs:
       - /run
       - /run/lock
-  - name: ubuntu-2404
+  - name: ubuntu-2404-${MOLECULE_RUN:-local}
     image: ubuntu:24.04
     buildargs:
       BASE: ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3

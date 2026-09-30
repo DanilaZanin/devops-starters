@@ -1,6 +1,6 @@
 # GitLab CI Terraform pipeline: plan in merge requests, apply on main, remote state
 
-Level: **lab** (static checks and trap tests run in CI; the pipeline itself is not executed).
+Level: **lab** (static policy checks and trap tests run in CI, plus a weekly smoke run of the demo image; the pipeline itself is not executed).
 
 A `.gitlab-ci.yml` template: lint, test, build and push an image to the project
 registry, `terraform plan` in merge requests and on the default branch, and
@@ -34,7 +34,8 @@ make test            # ruff, app tests, trap tests, terraform fmt/validate
 and ends with `terraform validate` (`init -backend=false`, which downloads the
 docker provider). The trap tests fail if any broken variant passes.
 
-`make up` builds the demo image and serves it on `127.0.0.1:8080`;
+`make up` builds the demo image, serves it on `127.0.0.1:8080` and fails unless
+`/health` answers; the weekly CI job runs it and always runs `make down`;
 `make down` stops it; `make reset` removes `.venv`, caches and `terraform/.terraform`;
 `make lock` regenerates the provider lock file (needs network).
 
@@ -56,6 +57,10 @@ docker provider). The trap tests fail if any broken variant passes.
    declared, state address set), not by running Terraform against GitLab.
 3. **Apply from a merge request.** Apply jobs have rules for the default branch only.
    Plans run in both. Production apply is `when: manual` with `allow_failure: false`.
+   The policy check evaluates the `rules:` of every plan and apply job for four pipeline
+   types (merge request, default branch, feature branch with and without an MR) with
+   GitLab's first-matching-rule semantics, so `if: $CI_DEFAULT_BRANCH` (always true), a
+   `!=` comparison, or an automatic rule listed before the manual one are all caught.
 4. **Concurrent applies.** `resource_group` per environment.
 5. **Provider drift.** `.terraform.lock.hcl` is committed (not git-ignored) and CI runs
    `terraform init -lockfile=readonly`.
@@ -68,13 +73,20 @@ Also: the image is built with a non-root user and a real `CMD`, and pushed to
 
 Proves:
 
-- The shipped `.gitlab-ci.yml` (with `extends` resolved the way GitLab merges it)
-  satisfies the policy in `checks/pipeline_policy.py`, and each mutation in
-  `tests/test_traps.py` (drop the entrypoint reset, allow apply in merge requests, remove
-  the production gate, drop the resource group, drop the push, drop the readonly
+- The shipped `.gitlab-ci.yml` (with `extends` resolved the way GitLab merges it and
+  `rules:if` evaluated per pipeline type) satisfies the policy in
+  `checks/pipeline_policy.py`, and each mutation in
+  `tests/test_traps.py` (drop the entrypoint reset, allow apply in merge requests through
+  a second rule, a bare `$CI_DEFAULT_BRANCH` or a `!=`, make the production apply automatic
+  or shadow its manual rule with an automatic one, let it fail with `allow_failure: true` on the
+  job or the rule, an unevaluable `=~` rule (fails closed), drop the resource group, drop the push, drop the readonly
   lock, drop the remote backend, git-ignore or delete the lock file, run the image as
   root, remove the CMD) is reported with the expected code.
 - `terraform fmt -check` and `terraform validate` pass; the app tests pass.
+
+These are static policy checks on the YAML, not a run of GitLab. The evaluator supports
+`$VAR`, string literals, `==`, `!=`, `&&`, `||` and parentheses; it does not know `=~`,
+`rules:changes` or `rules:exists`.
 
 Does NOT prove:
 
@@ -83,7 +95,7 @@ Does NOT prove:
   or use `gitlab-ci-local` (a third-party tool, not part of this module) before
   relying on it.
 - That state locking, the job token and the state API work. That needs a GitLab project.
-- That the trivy job passes inside GitLab. The same `trivy config` calls were run locally through the trivy image and were clean. The pinned job images (`hashicorp/terraform:1.16.4`, `docker:29`, `docker:29-dind`, `aquasec/trivy:0.74.0`, `python:3.14-slim`) were checked to exist with `docker manifest inspect`, but no job was run.
+- That the trivy job passes inside GitLab. The same `trivy config` calls were run locally through the trivy image and were clean. The pinned job images (`hashicorp/terraform:1.16.4`, `docker:29.8.1`, `docker:29.8.1-dind`, `aquasec/trivy:0.74.0`, `python:3.14.7-slim`) were checked to exist with `docker manifest inspect`, but no job was run.
 - That `apply` succeeds. The demo target is a container on the job's own docker-in-docker
   daemon, so it vanishes when the job ends while the state remembers it.
 
@@ -104,11 +116,15 @@ Does NOT prove:
 
 ## Copy it into your project
 
-Copy `.gitlab-ci.yml`, `terraform/`, `app/` and, if you want the regression tests,
-`checks/`, `tests/test_traps.py`, `pytest.ini`, `ruff.toml`, `requirements-dev.txt`
-and the `Makefile`. Adjust the policy in `checks/pipeline_policy.py` when you
-rename jobs (it expects `plan:<env>`, `apply:<env>`, `build`). No reference points
-outside this directory.
+Copy `.gitlab-ci.yml`, `terraform/`, `app/`, `requirements-dev.txt`, `pytest.ini`,
+`ruff.toml`, `tests/` and `checks/`. All of these are required: the pipeline's
+`lint:python` and `test:python` jobs install `requirements-dev.txt` and run `ruff` and
+`pytest` over `app/`, `tests/` and `checks/`. The `Makefile` is optional (local runs only).
+To ship a smaller set, delete the `.python_base`, `lint:python` and `test:python` jobs
+from `.gitlab-ci.yml` first, then `requirements-dev.txt`, `pytest.ini`, `ruff.toml`,
+`tests/` and `checks/` can go too; the policy tests go with them. Adjust the policy in
+`checks/pipeline_policy.py` when you rename jobs (it expects `plan:<env>`, `apply:<env>`,
+`build`). No reference points outside this directory.
 
 ## Layout
 

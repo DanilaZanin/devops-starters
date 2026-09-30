@@ -1,0 +1,11 @@
+---
+- name: Converge (Docker key bundle with an extra key)
+  hosts: all
+  become: true
+  tasks:
+    - name: Verify and export the Docker key from the two-key bundle
+      ansible.builtin.include_role:
+        name: docker_bootstrap
+        tasks_from: docker_key.yml
+      vars:
+        docker_bootstrap_gpg_key_url: file:///var/tmp/bundle.asc

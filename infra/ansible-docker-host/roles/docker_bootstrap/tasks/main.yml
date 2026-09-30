@@ -20,10 +20,13 @@
   ansible.builtin.import_tasks: node_exporter.yml
   tags: [monitoring]
 
-- name: Configure the firewall
-  ansible.builtin.import_tasks: firewall.yml
-  tags: [firewall]
-
+# sshd first, firewall second: ufw is only touched after sshd is confirmed to
+# listen on docker_bootstrap_ssh_port, so a port that never comes up cannot
+# lock you out (ssh_hardening.yml fails before the firewall changes).
 - name: Harden sshd
   ansible.builtin.import_tasks: ssh_hardening.yml
   tags: [ssh]
+
+- name: Configure the firewall
+  ansible.builtin.import_tasks: firewall.yml
+  tags: [firewall]

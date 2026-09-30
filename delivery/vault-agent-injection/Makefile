@@ -8,7 +8,7 @@ KIND_CLUSTER ?= vault-agent-injection
 KIND_NODE_IMAGE ?= kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
 # Images copied from your local docker into the kind node when present, so the test does not depend on
 # Docker Hub rate limits. (The chart pulls hashicorp/vault 2.0.4 and vault-k8s 1.7.6 itself; docker save cannot export those multi-arch images here.)
-PRELOAD_IMAGES ?= python:3.14-alpine
+PRELOAD_IMAGES ?= python:3.14.7-alpine
 
 # A private kubeconfig so nothing here touches ~/.kube/config or your current context.
 export KUBECONFIG := $(CURDIR)/.kube/config

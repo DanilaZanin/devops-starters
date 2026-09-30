@@ -6,6 +6,8 @@ docker_bootstrap_users: []
 # Source: https://docs.docker.com/engine/install/ubuntu/ ("Docker Release (CE deb)").
 docker_bootstrap_gpg_key_url: https://download.docker.com/linux/ubuntu/gpg
 docker_bootstrap_gpg_fingerprint: "9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+# Keyring written by the role: contains only the key with the fingerprint above.
+docker_bootstrap_keyring: /etc/apt/keyrings/docker.gpg
 
 # Map of `ansible_facts['architecture']` to the name Docker and node_exporter use.
 docker_bootstrap_arch_map:
@@ -27,6 +29,8 @@ docker_bootstrap_firewall_extra_tcp_ports: []
 
 # SSH hardening (written to a drop-in that sorts before 50-cloud-init.conf)
 docker_bootstrap_ssh_port: 22
+# Seconds to wait for sshd to listen on that port before the firewall is touched.
+docker_bootstrap_ssh_listen_timeout: 30
 docker_bootstrap_ssh_disable_password_auth: true
 docker_bootstrap_ssh_disable_root_login: true
 docker_bootstrap_ssh_dropin_name: 00-hardening.conf

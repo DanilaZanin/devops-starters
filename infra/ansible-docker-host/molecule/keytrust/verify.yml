@@ -1,0 +1,55 @@
+---
+- name: Verify that apt would trust only the Docker key
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Read the downloaded bundle, the apt keyring and the foreign fingerprint
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          echo "bundle_pubs=$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc | grep -c '^pub:')"
+          echo "keyring_pubs=$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.gpg | grep -c '^pub:')"
+          echo "keyring_foreign=$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.gpg | grep -c "$(cat /var/tmp/foreign.fpr)")"
+          echo "keyring_docker=$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.gpg | grep -c 9DC858229FC7DD38854AE2D88D81803C0EBFCD88)"
+        executable: /bin/bash
+      register: state
+      changed_when: false
+
+    - name: The bundle had two keys, the keyring has only Docker's
+      ansible.builtin.assert:
+        that:
+          - "'bundle_pubs=2' in state.stdout_lines"
+          - "'keyring_pubs=1' in state.stdout_lines"
+          - "'keyring_foreign=0' in state.stdout_lines"
+          - "'keyring_docker=1' in state.stdout_lines"
+        fail_msg: "KEY_TRUST_BROKEN: {{ state.stdout_lines }}"
+        quiet: true
+
+    - name: A wrong expected fingerprint must be refused
+      block:
+        - name: Run the key task with a fingerprint that is not in the bundle
+          ansible.builtin.include_role:
+            name: docker_bootstrap
+            tasks_from: docker_key.yml
+          vars:
+            docker_bootstrap_gpg_key_url: file:///var/tmp/bundle.asc
+            docker_bootstrap_gpg_fingerprint: "0000000000000000000000000000000000000000"
+        - name: Must not get here
+          ansible.builtin.fail:
+            msg: KEY_TRUST_BROKEN wrong fingerprint was accepted
+      rescue:
+        - name: Read what is left on disk
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop:
+            - /etc/apt/keyrings/docker.asc
+            - /etc/apt/keyrings/docker.gpg
+          register: leftovers
+
+        - name: Refused, and no key material remains
+          ansible.builtin.assert:
+            that:
+              - "'KEY_TRUST_BROKEN' not in (ansible_failed_result.msg | default(''))"
+              - leftovers.results | map(attribute='stat.exists') | select | list | length == 0
+            quiet: true

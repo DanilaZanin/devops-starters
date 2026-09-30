@@ -22,7 +22,7 @@ variables:
 # ---------------------------------------------------------------- lint / test
 
 .python_base:
-  image: python:3.14-slim
+  image: python:3.14.7-slim
   before_script:
     - pip install --quiet -r requirements-dev.txt
 
@@ -51,7 +51,7 @@ test:python:
     name: hashicorp/terraform:1.16.4
     entrypoint: [""]
   services:
-    - docker:29-dind
+    - docker:29.8.1-dind
   variables:
     # The demo target is a container on this job's dind daemon.
     DOCKER_HOST: tcp://docker:2375
@@ -99,9 +99,9 @@ lint:trivy:
 
 build:
   stage: build
-  image: docker:29
+  image: docker:29.8.1
   services:
-    - docker:29-dind
+    - docker:29.8.1-dind
   variables:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""

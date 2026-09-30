@@ -4,10 +4,15 @@
 #
 #   1. install dev-mode Vault + injector (pinned chart)
 #   2. write a random secret, enable Kubernetes auth, create the role
-#   3. TRAP: apply the broken policy (KV v1-style path) and deploy the app.
-#      The injected init container must be denied and the app must not start.
-#   4. FIX: apply the real policy and recreate the pod. The app must start and
-#      report the SHA-256 of the random secret, which this script recomputes.
+#   3. TRAP: apply the broken policy (KV v1-style path) and deploy the app on a
+#      freshly created pod. The injected agent must log in successfully and then
+#      be denied on secret/data/demo-app specifically; the app must not start.
+#   4. FIX: apply the real policy and recreate the pod. The new pod must become
+#      ready and report the SHA-256 of the random secret, which this script
+#      recomputes.
+#
+# Safe to run again on a cluster left behind by `make up`: pods are always
+# recreated before they are inspected, so old logs and old pods never count.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -36,16 +41,48 @@ sha256_of() {
   fi
 }
 
+# Names of the app pods that are not terminating, one per line.
+app_pods() {
+  kubectl -n demo-app get pods -l app=demo-app \
+    -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}'
+}
+
+# Delete the current app pod(s) and print the name of the pod that replaces
+# them. A Deployment that did not change would never re-run the injected init
+# container, so a stale pod from an earlier run must not be inspected.
+recreate_app_pod() {
+  local old name deadline
+  old=$(app_pods)
+  kubectl -n demo-app delete pod -l app=demo-app --wait=true >/dev/null
+  deadline=$((SECONDS + 120))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    name=$(app_pods | head -1)
+    if [ -n "$name" ] && ! printf '%s\n' "$old" | grep -qx "$name"; then
+      printf '%s\n' "$name"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "FAIL: no new app pod appeared within 120s" >&2
+  return 1
+}
+
 app_ready() {
-  [ "$(kubectl -n demo-app get pods -l app=demo-app \
-    -o jsonpath='{.items[0].status.containerStatuses[?(@.name=="demo-app")].ready}' 2>/dev/null)" = true ]
+  [ "$(kubectl -n demo-app get pod "$1" \
+    -o jsonpath='{.status.containerStatuses[?(@.name=="demo-app")].ready}' 2>/dev/null)" = true ]
 }
 
 echo ">> install Vault (dev mode) and the injector, chart $VAULT_CHART_VERSION"
-helm upgrade --install vault vault --repo https://helm.releases.hashicorp.com \
-  --version "$VAULT_CHART_VERSION" -n vault --create-namespace \
-  -f manifests/vault-values.yaml --set server.dev.devRootToken="$VAULT_DEV_ROOT_TOKEN" \
-  --wait --timeout 300s >/dev/null
+# On a cluster kept by `make up` the release exists; upgrading it again fails
+# on the injector's webhook caBundle (owned by vault-k8s), so leave it alone.
+if helm status vault -n vault >/dev/null 2>&1; then
+  echo "vault release already installed, reusing it"
+else
+  helm install vault vault --repo https://helm.releases.hashicorp.com \
+    --version "$VAULT_CHART_VERSION" -n vault --create-namespace \
+    -f manifests/vault-values.yaml --set server.dev.devRootToken="$VAULT_DEV_ROOT_TOKEN" \
+    --wait --timeout 300s >/dev/null
+fi
 # helm 4 can return from --wait before the StatefulSet pod is ready; wait explicitly.
 kubectl -n vault wait --for=condition=Ready pod/vault-0 --timeout=300s >/dev/null
 kubectl -n vault rollout status deploy/vault-agent-injector --timeout=300s >/dev/null
@@ -71,34 +108,54 @@ vault_exec_stdin vault policy write demo-app - <traps/broken-policy.hcl >/dev/nu
 kubectl apply -f manifests/serviceaccount.yaml >/dev/null
 kubectl apply -f manifests/app.yaml >/dev/null
 
+# A NEW pod runs the init container against the broken policy.
+broken_pod=$(recreate_app_pod)
+echo "inspecting pod $broken_pod"
+
+# Proven separately: (a) the Kubernetes login succeeded, so the role and the
+# service account are fine, and (b) the read of secret/data/demo-app, and
+# nothing else, was denied.
 denied=0
+logs=""
 deadline=$((SECONDS + 150))
 while [ "$SECONDS" -lt "$deadline" ]; do
-  logs=$(kubectl -n demo-app logs deploy/demo-app -c vault-agent-init 2>&1 || true)
-  if printf '%s' "$logs" | grep -Eqi 'permission denied|code: 403'; then
+  logs=$(kubectl -n demo-app logs "$broken_pod" -c vault-agent-init 2>&1 || true)
+  if printf '%s\n' "$logs" | grep -q 'authentication successful' \
+    && printf '%s\n' "$logs" | grep -A4 -E 'URL: GET .*/v1/secret/data/demo-app' | grep -Eqi 'permission denied|Code: 403'; then
     denied=1
     break
   fi
   sleep 3
 done
 if [ "$denied" != 1 ]; then
-  echo "FAIL: the injector init container was never denied; trap not reproduced" >&2
-  kubectl -n demo-app describe pods >&2 || true
+  echo "FAIL: expected a successful login followed by a denied read of secret/data/demo-app; trap not reproduced" >&2
+  if printf '%s\n' "$logs" | grep -Eqi 'auth/kubernetes/login'; then
+    echo "note: the log mentions auth/kubernetes/login, so the failure may be the login, not the KV path" >&2
+  fi
+  printf '%s\n' "$logs" | tail -n 30 >&2
+  kubectl -n demo-app describe pod "$broken_pod" >&2 || true
   exit 1
 fi
-if app_ready; then
+if app_ready "$broken_pod"; then
   echo "FAIL: the app became ready with the broken policy" >&2
   exit 1
 fi
-echo "OK: trap reproduced. vault-agent-init got permission denied and the app is not running."
+echo "OK: trap reproduced. Login worked, the read of secret/data/demo-app was denied, the app is not running."
 
 echo ">> FIX: policy on secret/data/demo-app, recreate the pod"
 vault_exec_stdin vault policy write demo-app - <policies/demo-app-policy.hcl >/dev/null
-kubectl -n demo-app delete pod -l app=demo-app --wait=true >/dev/null
-kubectl -n demo-app rollout status deploy/demo-app --timeout=180s >/dev/null
+fixed_pod=$(recreate_app_pod)
+echo "inspecting pod $fixed_pod"
+if [ "$fixed_pod" = "$broken_pod" ]; then
+  echo "FAIL: the pod was not recreated" >&2
+  exit 1
+fi
+kubectl -n demo-app wait --for=condition=Ready "pod/$fixed_pod" --timeout=180s >/dev/null
+kubectl -n demo-app logs "$fixed_pod" -c vault-agent-init 2>&1 | grep -q 'rendered .* => "/vault/secrets/db-creds"' \
+  || { echo "FAIL: the new pod's init container did not render /vault/secrets/db-creds" >&2; exit 1; }
 
 echo ">> the app must report the hash of the secret it read from /vault/secrets"
-response=$(kubectl -n demo-app exec deploy/demo-app -c demo-app -- \
+response=$(kubectl -n demo-app exec "$fixed_pod" -c demo-app -- \
   python -c 'import urllib.request; print(urllib.request.urlopen("http://127.0.0.1:8080/").read().decode())')
 expected=$(sha256_of "$db_password")
 if ! printf '%s' "$response" | grep -q "\"db_password_sha256\": \"$expected\""; then

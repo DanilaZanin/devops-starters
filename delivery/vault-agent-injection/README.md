@@ -28,17 +28,19 @@ a private kubeconfig (`.kube/`), runs `scripts/e2e.sh`, and deletes the cluster.
 Expected lines:
 
 ```
-OK: trap reproduced. vault-agent-init got permission denied and the app is not running.
+OK: trap reproduced. Login worked, the read of secret/data/demo-app was denied, the app is not running.
 OK: the app read the secret from /vault/secrets and reported its SHA-256.
 OK: no secret value in the Deployment.
 ```
 
-`make up` runs the same script and keeps the cluster; `make down` removes it;
+`make up` runs the same script and keeps the cluster; running `scripts/e2e.sh` again on
+that cluster works (the Vault release is reused and the app pod is recreated before every
+inspection, so logs from an earlier run never count); `make down` removes it;
 `make reset` also deletes `.kube/` and `.env`.
 
 | | Status |
 |---|---|
-| macOS arm64 + colima (4 CPU / 8 GB) | verified 2026-09-29: `make test` green, also from a copied directory. hashicorp/vault chart 0.34.1 (Vault 2.0.4, vault-k8s 1.7.6), kind 0.33.0, node image v1.37.0 pinned by digest, helm 4.3.0 |
+| macOS arm64 + colima (4 CPU / 8 GB) | verified 2026-09-30: `make test` green from a copied directory (1 min 40 s), and `scripts/e2e.sh` re-run on a kept cluster. hashicorp/vault chart 0.34.1 (Vault 2.0.4, vault-k8s 1.7.6), kind 0.33.0, node image v1.37.0 pinned by digest, helm 4.3.0 |
 | ubuntu-24.04 GitHub runner | CI only, not measured here; see `.github/workflows/vault-agent-injection.yml` |
 | First-run time | about 67 s for `make test` with the kind node image and the Vault images already pulled once; a cold machine adds the image pulls (not measured) |
 | RAM | peak about 1.7 GB used in the colima VM (kind node, Vault dev pod, injector, app; other containers were running too, so an upper bound) |
@@ -63,8 +65,11 @@ script has been stable across several weekly runs.
 
 Proves, on a real cluster:
 
-- With the broken policy, `vault-agent-init` is denied and the app container never
-  becomes ready. With the fixed policy and a fresh pod, the app starts.
+- With the broken policy, a freshly created pod's `vault-agent-init` logs in successfully
+  (so the role and service account are fine) and is then denied on
+  `GET /v1/secret/data/demo-app`; the app container never becomes ready. A denied login
+  is not accepted as the trap. With the fixed policy and another fresh pod, the app starts
+  and the init container renders `/vault/secrets/db-creds`.
 - The app returns the SHA-256 of a random `db_password` written to Vault at test
   time, computed independently by the script, and does not return the raw value.
 
