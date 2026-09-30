@@ -18,3 +18,15 @@
     - name: Check that sshd_config includes the drop-in directory
       ansible.builtin.command: grep -Eq '^Include /etc/ssh/sshd_config.d/\*\.conf' /etc/ssh/sshd_config
       changed_when: false
+
+    # A host set up by an older version of this role has a source line that
+    # trusts docker.asc. The role must replace it, or apt refuses all sources
+    # with "Conflicting values set for option Signed-By".
+    - name: Simulate the docker apt source left by an older run
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/docker.list
+        content: |
+          deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu stale stable
+        owner: root
+        group: root
+        mode: "0644"
