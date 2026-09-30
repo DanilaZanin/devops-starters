@@ -175,7 +175,7 @@ Version pins: Ubuntu base images `ubuntu:22.04` and `ubuntu:24.04`, node_exporte
 `molecule/*/molecule.yml`). Test tooling is pinned exactly in `requirements-dev.txt`
 (ansible-core 2.21.4, ansible-lint 26.9.0, molecule 26.9.0, molecule-plugins 26.9.28)
 and the collections: `requirements.yml` holds the role's runtime dependency (community.general 13.4.0),
-`molecule/requirements.yml` adds the test-only community.docker 5.3.0 for the molecule docker driver.
+`molecule/requirements.yml` adds the test-only community.docker 5.3.0 and ansible.posix 2.2.2 for the molecule docker driver.
 
 ## Copy it into your project
 
