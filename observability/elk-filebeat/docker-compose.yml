@@ -1,51 +1,140 @@
+name: ${COMPOSE_PROJECT_NAME:-elk-filebeat}
+
 services:
   elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
-    container_name: elk-elasticsearch
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.5.4
     environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      discovery.type: single-node
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:?set ELASTIC_PASSWORD in .env}
+      xpack.security.enabled: "true"
+      # Demo shortcut: HTTP and transport TLS are off, so passwords cross the
+      # docker network in clear text. Fine on one host, not on a shared network.
+      xpack.security.http.ssl.enabled: "false"
+      xpack.security.transport.ssl.enabled: "false"
     ports:
-      - "9200:9200"
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"]
+      test: ["CMD-SHELL", "curl -sf -u \"elastic:$${ELASTIC_PASSWORD}\" \"http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s\" > /dev/null"]
       interval: 10s
-      timeout: 5s
+      timeout: 10s
       retries: 20
+      start_period: 30s
+
+  # One-shot: ILM policy (7 day retention), index template, the kibana_system password
+  # and a least-privilege user for Filebeat. Safe to run again.
+  setup:
+    build:
+      context: .
+      dockerfile: setup/Dockerfile
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:?set ELASTIC_PASSWORD in .env}
+      KIBANA_PASSWORD: ${KIBANA_PASSWORD:?set KIBANA_PASSWORD in .env}
+      FILEBEAT_PASSWORD: ${FILEBEAT_PASSWORD:?set FILEBEAT_PASSWORD in .env}
+    entrypoint: ["bash", "/setup.sh"]
 
   kibana:
-    image: docker.elastic.co/kibana/kibana:8.15.0
-    container_name: elk-kibana
+    image: docker.elastic.co/kibana/kibana:9.5.4
     depends_on:
-      elasticsearch:
-        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
     environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      ELASTICSEARCH_USERNAME: kibana_system
+      ELASTICSEARCH_PASSWORD: ${KIBANA_PASSWORD:?set KIBANA_PASSWORD in .env}
+      XPACK_SECURITY_ENCRYPTIONKEY: ${KIBANA_ENCRYPTION_KEY:?set KIBANA_ENCRYPTION_KEY in .env}
+      XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY: ${KIBANA_ENCRYPTION_KEY:?set KIBANA_ENCRYPTION_KEY in .env}
+      XPACK_REPORTING_ENCRYPTIONKEY: ${KIBANA_ENCRYPTION_KEY:?set KIBANA_ENCRYPTION_KEY in .env}
     ports:
-      - "5601:5601"
+      - "127.0.0.1:5601:5601"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -I http://localhost:5601 | grep -q 'HTTP/1.1 302 Found'"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
 
   filebeat:
-    image: docker.elastic.co/beats/filebeat:8.15.0
-    container_name: elk-filebeat
+    build:
+      context: .
+      dockerfile: filebeat/Dockerfile
+      args:
+        # Lets the smoke test build the broken config.
+        FILEBEAT_CONFIG: ${FILEBEAT_CONFIG:-filebeat/filebeat.yml}
+    # Root is required to read other containers' log files under /var/lib/docker.
+    # Filebeat does NOT get the Docker socket: it asks docker-proxy (below) for
+    # container metadata and events, and nothing else.
     user: root
     depends_on:
-      elasticsearch:
+      setup:
+        condition: service_completed_successfully
+      docker-proxy:
         condition: service_healthy
+    environment:
+      FILEBEAT_PASSWORD: ${FILEBEAT_PASSWORD:?set FILEBEAT_PASSWORD in .env}
+      # Only the collect-all trap config reads it (to stay inside this project).
+      COMPOSE_PROJECT_NAME: ${COMPOSE_PROJECT_NAME:-elk-filebeat}
+    networks:
+      - default
+      - docker-api
     volumes:
-      - ./filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
       - filebeat-data:/usr/share/filebeat/data
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    command: ["--strict.perms=false"]
+    healthcheck:
+      test: ["CMD-SHELL", "filebeat test output > /dev/null 2>&1"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 20s
 
-  # stand-in for "any existing docker-compose project" you'd point this at -
-  # the only thing that makes its logs get picked up is the co.elastic.logs/enabled label
+  # The only container that touches the Docker socket. HAProxy in front of it (own config,
+  # docker-proxy/haproxy.cfg) answers GET for a path allowlist only: /version, /info, /_ping,
+  # /containers/json, /containers/{id}/json and /events. Everything else gets 403 (POST, exec,
+  # logs, archive, and the attach/ws websocket that could feed stdin to a container).
+  # It sits on an internal network shared with Filebeat only.
+  # Note: read access to /containers/{id}/json still exposes every container's environment
+  # (`docker inspect`), see the README.
+  docker-proxy:
+    build:
+      context: .
+      dockerfile: docker-proxy/Dockerfile
+    networks:
+      - docker-api
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:2375/_ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # Stand-ins for "services from your own compose project".
+  # This one opts in to collection with the co.elastic.logs/enabled label.
   demo-app:
-    image: nginxinc/nginx-unprivileged:1.27-alpine
-    container_name: elk-demo-app
+    image: busybox:1.37.0
+    user: nobody
     labels:
-      enable_logging: "true"
+      co.elastic.logs/enabled: "true"
+    command: ["sh", "-c", "i=0; while true; do echo \"demo log line $$i\"; i=$$((i+1)); sleep 1; done"]
+
+  # No label: its logs must NOT reach Elasticsearch.
+  quiet-app:
+    image: busybox:1.37.0
+    user: nobody
+    command: ["sh", "-c", "i=0; while true; do echo \"quiet log line $$i\"; i=$$((i+1)); sleep 1; done"]
+
+networks:
+  # Filebeat <-> docker-proxy only, no route to the outside.
+  docker-api:
+    internal: true
 
 volumes:
+  es-data:
   filebeat-data:

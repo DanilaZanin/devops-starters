@@ -1,0 +1,25 @@
+[project]
+name = "redis-cache-aside"
+version = "0.1.0"
+description = "FastAPI + Redis cache-aside example: stampede protection and fail-open reads"
+requires-python = ">=3.12"
+# Keep in sync with requirements.txt (the Docker image installs from that file).
+dependencies = [
+    "fastapi==0.142.0",
+    "uvicorn[standard]==0.54.0",
+    "redis==8.1.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "httpx==0.28.1",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"

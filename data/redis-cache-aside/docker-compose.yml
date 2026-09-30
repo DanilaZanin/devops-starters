@@ -1,22 +1,48 @@
+name: redis-cache-aside
+
 services:
   redis:
-    image: redis:7-alpine
-    container_name: cache-demo-redis
+    image: redis:8.10.2-alpine
+    # The image starts as root and drops to `redis` itself when the command is
+    # redis-server. We wrap the command in sh (to read the password from the
+    # environment), so ask for the unprivileged user directly.
+    user: redis
+    command:
+      - sh
+      - -c
+      - exec redis-server --requirepass "$$REDIS_PASSWORD" --maxmemory 64mb --maxmemory-policy allkeys-lru --save "" --appendonly no
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
       interval: 3s
       timeout: 3s
       retries: 10
 
   app:
     build: .
-    container_name: cache-demo-app
     depends_on:
       redis:
         condition: service_healthy
     environment:
-      REDIS_URL: redis://redis:6379/0
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+      CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-30}
+      SOURCE_LATENCY_S: ${SOURCE_LATENCY_S:-0.5}
+      LOCK_TTL_MS: ${LOCK_TTL_MS:-5000}
+      LOCK_WAIT_S: ${LOCK_WAIT_S:-6}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped

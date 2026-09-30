@@ -1,0 +1,40 @@
+name: rabbitmq-retry-dlq
+
+on:
+  pull_request:
+    paths:
+      - "data/rabbitmq-retry-dlq/**"
+      - ".github/workflows/rabbitmq-retry-dlq.yml"
+  push:
+    branches: [main]
+    paths:
+      - "data/rabbitmq-retry-dlq/**"
+      - ".github/workflows/rabbitmq-retry-dlq.yml"
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rabbitmq-retry-dlq-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trap-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - name: Copy the module out of the repository
+        run: cp -r data/rabbitmq-retry-dlq "$RUNNER_TEMP/module"
+      - name: make test (in the copy, so nothing depends on the repo root)
+        run: cd "$RUNNER_TEMP/module" && make test
+      - name: Container logs (on failure)
+        if: failure()
+        run: cd "$RUNNER_TEMP/module" && docker compose logs --no-color --tail 100
+      - name: make reset
+        if: always()
+        run: cd "$RUNNER_TEMP/module" && make reset
