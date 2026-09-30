@@ -1,0 +1,7 @@
+---
+profile: production
+exclude_paths:
+  - .collections/
+  - .cache/
+  # Deliberately broken tasks used only by molecule/broken.
+  - traps/

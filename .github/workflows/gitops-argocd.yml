@@ -1,0 +1,65 @@
+name: gitops-argocd
+
+on:
+  pull_request:
+    paths:
+      - "delivery/gitops-argocd/**"
+      - ".github/workflows/gitops-argocd.yml"
+  push:
+    branches: [main]
+    paths:
+      - "delivery/gitops-argocd/**"
+      - ".github/workflows/gitops-argocd.yml"
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  KUBECONFORM_VERSION: v0.8.0
+  # sha256 of kubeconform-linux-amd64.tar.gz for that version (matches the release's CHECKSUMS file).
+  KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # kind, kubectl and helm are preinstalled on GitHub's ubuntu runners.
+      - name: Install kubeconform (SHA-256 checked before unpacking)
+        run: |
+          archive="$RUNNER_TEMP/kubeconform.tgz"
+          curl -sSfL -o "$archive" \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  ${archive}" | sha256sum --check --strict -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/bin" kubeconform
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Show tool versions
+        run: |
+          docker version --format '{{.Server.Version}}'
+          kind version
+          kubectl version --client
+          helm version --short
+          kubeconform -v
+
+      # Copies the module out of the repo so a hidden dependency on the root
+      # shows up as a failure, then runs the full suite in the copy.
+      - name: copy-test (make test in a copy of the module)
+        run: |
+          dest="$RUNNER_TEMP/gitops-argocd"
+          cp -r delivery/gitops-argocd "$dest"
+          make -C "$dest" test
+
+      - name: Clean up kind cluster
+        if: always()
+        run: make -C "$RUNNER_TEMP/gitops-argocd" down || true

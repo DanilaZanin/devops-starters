@@ -1,26 +1,26 @@
 variable "name" {
-  description = "Base name for the instance(s). A numeric suffix is appended when count > 1."
+  description = "Base name for the instance(s). A numeric suffix is appended when replicas > 1."
   type        = string
 }
 
 variable "image" {
-  description = "Container image to run, e.g. nginx:1.27-alpine."
+  description = "Container image to run, e.g. nginxinc/nginx-unprivileged:1.30.2-alpine. Use an image that runs as non-root."
   type        = string
 }
 
-variable "count_" {
-  description = "Number of instances to create (mirrors an ASG-style `desired_capacity`)."
+variable "replicas" {
+  description = "Number of instances to create (mirrors an ASG-style desired capacity)."
   type        = number
   default     = 1
-}
 
-variable "network_id" {
-  description = "ID of the network to attach the instance(s) to (output of the network module)."
-  type        = string
+  validation {
+    condition     = var.replicas >= 1 && floor(var.replicas) == var.replicas
+    error_message = "replicas must be a whole number, at least 1."
+  }
 }
 
 variable "network_name" {
-  description = "Name of the network to attach the instance(s) to."
+  description = "Name of the network to attach the instance(s) to (output of the network module)."
   type        = string
 }
 
@@ -35,6 +35,12 @@ variable "security_group_rules" {
   default = []
 }
 
+variable "bind_ip" {
+  description = "Host address the published ports listen on. Loopback by default; use 0.0.0.0 to expose them on every interface."
+  type        = string
+  default     = "127.0.0.1"
+}
+
 variable "env" {
   description = "Environment variables to inject into the instance, e.g. app config."
   type        = map(string)
@@ -45,4 +51,15 @@ variable "command" {
   description = "Override the container's default command. Leave null to use the image's own entrypoint."
   type        = list(string)
   default     = null
+}
+
+variable "healthcheck" {
+  description = "Container health check. Leave null to use the image's own."
+  type = object({
+    test     = list(string)
+    interval = optional(string, "10s")
+    timeout  = optional(string, "3s")
+    retries  = optional(number, 3)
+  })
+  default = null
 }

@@ -1,0 +1,7 @@
+---
+# Docker and node_exporter are skipped through skip-tags in molecule.yml.
+- name: Converge (ssh_port=2222)
+  hosts: all
+  become: true
+  roles:
+    - role: docker_bootstrap

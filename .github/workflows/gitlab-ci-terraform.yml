@@ -1,0 +1,70 @@
+name: gitlab-ci-terraform
+
+on:
+  pull_request:
+    paths:
+      - "delivery/gitlab-ci-terraform/**"
+      - ".github/workflows/gitlab-ci-terraform.yml"
+  push:
+    branches: [main]
+    paths:
+      - "delivery/gitlab-ci-terraform/**"
+      - ".github/workflows/gitlab-ci-terraform.yml"
+  schedule:
+    - cron: "43 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.16.4"
+          terraform_wrapper: false
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: delivery/gitlab-ci-terraform/app/Dockerfile
+
+      # Copies the module out of the repo so a hidden dependency on the root
+      # shows up as a failure, then runs the full suite in the copy.
+      - name: copy-test (make test in a copy of the module)
+        run: |
+          dest="$RUNNER_TEMP/gitlab-ci-terraform"
+          cp -r delivery/gitlab-ci-terraform "$dest"
+          make -C "$dest" test
+
+  # Weekly and on demand: build the demo image, run it, require /health to answer,
+  # and always remove the container. Skipped on pull requests.
+  smoke-up:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: copy-test (make up in a copy of the module; fails unless /health answers)
+        run: |
+          dest="$RUNNER_TEMP/gitlab-ci-terraform"
+          cp -r delivery/gitlab-ci-terraform "$dest"
+          make -C "$dest" up
+
+      - name: Remove the demo container
+        if: always()
+        run: make -C "$RUNNER_TEMP/gitlab-ci-terraform" down || true

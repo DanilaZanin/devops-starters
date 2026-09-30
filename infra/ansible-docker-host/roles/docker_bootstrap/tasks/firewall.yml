@@ -1,35 +1,49 @@
 ---
-- name: install ufw
-  apt:
+# NOTE: ufw does not filter ports published by `docker run -p` / compose,
+# because Docker writes its own iptables rules ahead of ufw's. See the
+# README section "Docker publish bypasses ufw" before trusting this firewall
+# for containers.
+
+- name: Install ufw
+  ansible.builtin.apt:
     name: ufw
     state: present
+    cache_valid_time: 3600
 
-- name: default deny incoming
+- name: Default deny incoming
   community.general.ufw:
     default: deny
     direction: incoming
 
-- name: default allow outgoing
+- name: Default allow outgoing
   community.general.ufw:
     default: allow
     direction: outgoing
 
-- name: allow admin-facing tcp ports
+# Always the same variable sshd is configured with: the firewall and sshd
+# cannot disagree about the SSH port.
+- name: Allow the ssh port
   community.general.ufw:
     rule: allow
-    port: "{{ item }}"
+    port: "{{ docker_bootstrap_ssh_port | string }}"
     proto: tcp
-  loop: "{{ firewall_allowed_tcp_ports }}"
 
-- name: allow node_exporter only from the monitoring CIDRs
+- name: Allow extra admin-facing tcp ports
   community.general.ufw:
     rule: allow
-    port: "{{ node_exporter_port }}"
+    port: "{{ item | string }}"
+    proto: tcp
+  loop: "{{ docker_bootstrap_firewall_extra_tcp_ports }}"
+
+- name: Allow node_exporter only from the monitoring CIDRs
+  community.general.ufw:
+    rule: allow
+    port: "{{ docker_bootstrap_node_exporter_port | string }}"
     proto: tcp
     src: "{{ item }}"
-  loop: "{{ node_exporter_allowed_cidrs }}"
+  loop: "{{ docker_bootstrap_node_exporter_allowed_cidrs }}"
 
-- name: enable ufw
+- name: Enable ufw
   community.general.ufw:
     state: enabled
-  when: firewall_enabled
+  when: docker_bootstrap_firewall_enabled | bool

@@ -1,0 +1,17 @@
+---
+# The "obvious" hardening from traps/broken_ssh_hardening.yml. Expected to
+# converge without errors and then FAIL verify (see the Makefile `trap` target).
+- name: Converge (broken hardening)
+  hosts: all
+  become: true
+  tasks:
+    - name: Create the sshd privilege separation directory
+      ansible.builtin.file:
+        path: /run/sshd
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Apply the broken sshd_config edit
+      ansible.builtin.import_tasks: ../../traps/broken_ssh_hardening.yml

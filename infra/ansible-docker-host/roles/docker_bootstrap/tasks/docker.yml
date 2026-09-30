@@ -1,10 +1,11 @@
 ---
 # Installs Docker Engine from the official repo, not the (usually stale)
-# distro package. Mirrors what get.docker.com does but idempotently and
-# without piping curl to sh in prod.
+# distro package, and refuses to trust the repo key unless its fingerprint
+# matches docker_bootstrap_gpg_fingerprint,
+# and puts ONLY that key into the keyring that apt's signed-by points at.
 
-- name: install prerequisite packages
-  apt:
+- name: Install prerequisite packages
+  ansible.builtin.apt:
     name:
       - ca-certificates
       - curl
@@ -13,53 +14,37 @@
     update_cache: true
     cache_valid_time: 3600
 
-- name: create keyrings dir
-  file:
-    path: /etc/apt/keyrings
-    state: directory
-    mode: "0755"
+- name: Trust only the verified Docker apt key
+  ansible.builtin.import_tasks: docker_key.yml
 
-- name: check if docker gpg key already present
-  stat:
-    path: /etc/apt/keyrings/docker.asc
-  register: docker_gpg_key
-
-- name: download docker gpg key
-  get_url:
-    url: https://download.docker.com/linux/ubuntu/gpg
-    dest: /etc/apt/keyrings/docker.asc
-    mode: "0644"
-  when: not docker_gpg_key.stat.exists
-
-- name: add docker apt repository
-  apt_repository:
+- name: Add docker apt repository
+  ansible.builtin.apt_repository:
     repo: >-
-      deb [arch={{ ansible_architecture == 'x86_64' and 'amd64' or ansible_architecture }}
-      signed-by=/etc/apt/keyrings/docker.asc]
-      https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+      deb [arch={{ docker_bootstrap_arch_map[ansible_facts['architecture']] }}
+      signed-by={{ docker_bootstrap_keyring }}]
+      https://download.docker.com/linux/ubuntu {{ ansible_facts['distribution_release'] }} stable
     filename: docker
     state: present
 
-- name: install docker engine
-  apt:
+- name: Install docker engine
+  ansible.builtin.apt:
     name:
       - docker-ce
       - docker-ce-cli
       - containerd.io
       - docker-compose-plugin
     state: present
-    update_cache: true
+    cache_valid_time: 3600
 
-- name: make sure docker is enabled and running
-  systemd:
+- name: Make sure docker is enabled and running
+  ansible.builtin.systemd_service:
     name: docker
     enabled: true
     state: started
 
-- name: add users to the docker group
-  user:
+- name: Add users to the docker group
+  ansible.builtin.user:
     name: "{{ item }}"
     groups: docker
     append: true
   loop: "{{ docker_bootstrap_users }}"
-  when: docker_bootstrap_users | length > 0

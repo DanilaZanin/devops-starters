@@ -10,32 +10,54 @@ spec:
   {{- end }}
   selector:
     matchLabels:
-      {{- include "demo-app.labels" . | nindent 6 }}
+      {{- include "demo-app.selectorLabels" . | nindent 6 }}
   template:
     metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
       labels:
         {{- include "demo-app.labels" . | nindent 8 }}
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ .Values.securityContext.runAsUser }}
+        runAsGroup: {{ .Values.securityContext.runAsUser }}
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: demo-app
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
-            - containerPort: {{ .Values.containerPort }}
+            - name: http
+              containerPort: {{ .Values.containerPort }}
           envFrom:
             - configMapRef:
                 name: {{ include "demo-app.fullname" . }}-env
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           readinessProbe:
             httpGet:
               path: /
-              port: {{ .Values.containerPort }}
+              port: http
             initialDelaySeconds: 2
             periodSeconds: 5
           livenessProbe:
             httpGet:
               path: /
-              port: {{ .Values.containerPort }}
+              port: http
             initialDelaySeconds: 5
             periodSeconds: 10
+          # nginx writes its pid file and temp dirs under /tmp.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

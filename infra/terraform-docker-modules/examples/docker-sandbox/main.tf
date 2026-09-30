@@ -4,7 +4,7 @@ module "network" {
   name   = "sandbox"
   subnet = "10.30.0.0/24"
   labels = {
-    project = "terraform-modules-starter"
+    project = "terraform-docker-modules"
   }
 }
 
@@ -23,10 +23,13 @@ module "web_sg" {
 module "web" {
   source = "../../modules/compute"
 
-  name                  = "sandbox-web"
-  image                 = "nginxinc/nginx-unprivileged:1.27-alpine"
-  count_                = 2
-  network_id            = module.network.network_id
-  network_name          = module.network.network_name
-  security_group_rules  = module.web_sg.rules
+  name                 = "sandbox-web"
+  image                = "nginxinc/nginx-unprivileged:1.30.2-alpine"
+  replicas             = 2
+  network_name         = module.network.network_name
+  security_group_rules = module.web_sg.rules
+
+  healthcheck = {
+    test = ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/"]
+  }
 }

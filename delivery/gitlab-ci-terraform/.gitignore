@@ -1,8 +1,12 @@
-.gitlab-ci-local/
-terraform/.terraform/
-terraform/.terraform.lock.hcl
-terraform/*.tfplan
-terraform/terraform.tfstate*
+.venv/
+.pytest_cache/
+.ruff_cache/
 __pycache__/
 *.pyc
 report.xml
+.gitlab-ci-local/
+terraform/.terraform/
+terraform/*.tfplan
+terraform/*.plan.txt
+terraform/*.tfstate*
+# .terraform.lock.hcl is committed on purpose.

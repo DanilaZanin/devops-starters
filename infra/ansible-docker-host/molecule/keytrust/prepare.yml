@@ -1,0 +1,33 @@
+---
+# Build a bundle "real Docker release key + a throwaway foreign key" and serve
+# it from a file:// URL, so the role's download step sees exactly that.
+- name: Prepare
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Install gnupg and curl
+      ansible.builtin.apt:
+        name: [gnupg, curl]
+        update_cache: true
+
+    - name: Download the real Docker key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /var/tmp/real.asc
+        mode: "0644"
+
+    - name: Generate a throwaway foreign key
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          export GNUPGHOME=$(mktemp -d)
+          gpg --batch --pinentry-mode loopback --passphrase '' --quick-generate-key 'Foreign Key <foreign@example.invalid>' rsa2048 sign never
+          gpg --batch --armor --export > /var/tmp/foreign.asc
+          gpg --batch --with-colons --fingerprint | awk -F: '/^fpr/ {print $10; exit}' > /var/tmp/foreign.fpr
+        executable: /bin/bash
+        creates: /var/tmp/foreign.fpr
+
+    - name: Concatenate both into one bundle
+      ansible.builtin.shell:
+        cmd: cat /var/tmp/real.asc /var/tmp/foreign.asc > /var/tmp/bundle.asc
+        creates: /var/tmp/bundle.asc

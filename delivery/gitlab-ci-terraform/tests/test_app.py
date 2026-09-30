@@ -1,16 +1,40 @@
-import sys
-import os
+import http.server
+import json
+import threading
+import urllib.error
+import urllib.request
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
-
-from app import add, is_palindrome
+import pytest
+import service
 
 
 def test_add():
-    assert add(2, 3) == 5
+    assert service.add(2, 3) == 5
 
 
 def test_is_palindrome():
-    assert is_palindrome("racecar")
-    assert is_palindrome("A man a plan a canal Panama")
-    assert not is_palindrome("hello")
+    assert service.is_palindrome("racecar")
+    assert service.is_palindrome("A man a plan a canal Panama")
+    assert not service.is_palindrome("hello")
+
+
+@pytest.fixture
+def server():
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), service.Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    httpd.shutdown()
+    httpd.server_close()
+
+
+def test_health(server):
+    with urllib.request.urlopen(f"{server}/health", timeout=5) as resp:
+        assert resp.status == 200
+        assert json.load(resp) == {"status": "ok"}
+
+
+def test_unknown_path_is_404(server):
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(f"{server}/nope", timeout=5)
+    assert exc.value.code == 404

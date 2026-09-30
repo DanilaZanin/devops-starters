@@ -1,11 +1,11 @@
 # Dev-mode values for the official hashicorp/vault helm chart.
-# Dev mode is unsealed automatically and keeps everything in memory —
-# fine for a local demo of the injection flow, not how you'd run this
-# in prod (you'd want HA mode + a real storage backend + auto-unseal).
+# Dev mode is unsealed automatically, keeps everything in memory and mounts a
+# KV v2 engine at secret/. Fine for a local demo of the injection flow; not a
+# way to run Vault. The root token is passed on the command line
+# (--set server.dev.devRootToken=...) from .env, not stored here.
 server:
   dev:
     enabled: true
-    devRootToken: "root"
 
 injector:
   enabled: true

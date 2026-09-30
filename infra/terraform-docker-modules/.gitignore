@@ -3,3 +3,5 @@
 *.tfstate.*
 crash.log
 *.tfvars
+# Lock files of the modules are produced by `make validate`; only the example's is committed.
+modules/**/.terraform.lock.hcl

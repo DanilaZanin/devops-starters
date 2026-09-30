@@ -7,11 +7,12 @@ Wants=network-online.target
 User=node_exporter
 Group=node_exporter
 Type=simple
-ExecStart=/usr/local/bin/node_exporter --web.listen-address=:{{ node_exporter_port }}
+ExecStart=/usr/local/bin/node_exporter --web.listen-address=:{{ docker_bootstrap_node_exporter_port }}
 Restart=on-failure
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

@@ -1,86 +1,115 @@
-# vault-k8s-secrets-demo
+# Vault Agent Injector on Kubernetes: pod stuck in Init with "permission denied" on a KV v2 secret
 
-A reference setup for injecting HashiCorp Vault secrets into a Kubernetes pod
-via the Vault Agent Injector — no application code ever talks to Vault's API,
-it just reads a file the sidecar wrote for it.
+Level: **lab** (end-to-end script; weekly CI plus on changes to this module).
 
-## Why this pattern
+Injects HashiCorp Vault secrets into a pod with the Vault Agent Injector. The
+application never talks to Vault: it reads a file written by the sidecar. The
+module includes an end-to-end test that runs on a throwaway kind cluster.
 
-The alternative (app fetches secrets itself with a Vault SDK + its own token
-lifecycle) means every service reimplements auth, renewal, and retry logic.
-The injector pattern moves all of that into a sidecar that's configured once
-per role — the app just reads `/vault/secrets/<name>` like any other file.
+## Problem
 
-## Structure
+You annotate a Deployment for Vault Agent injection, the pod stays in
+`Init:0/1`, and the `vault-agent-init` container logs `permission denied`
+(HTTP 403) even though the Kubernetes auth role and the secret both exist.
+A common cause is the policy path. On a KV version 2 mount the API path is
+`secret/data/<name>`, while `vault kv get secret/<name>` hides the `data/`
+segment. A policy written for `secret/<name>` grants nothing the agent needs.
+The Vault KV v2 documentation describes the `data/` and `metadata/` API paths.
 
-```
-manifests/
-  vault-values.yaml     # helm values for the official hashicorp/vault chart (dev mode + injector)
-  serviceaccount.yaml    # namespace + the service account the pod authenticates as
-  app-deployment.yaml     # the pod, with vault.hashicorp.com/* injection annotations
-policies/
-  demo-app-policy.hcl      # read-only access to secret/data/demo-app, nothing else
-```
-
-## How it fits together
-
-1. `auth/kubernetes` — Vault trusts the cluster's own service account tokens
-   to prove pod identity (configured against the in-cluster API server, no
-   extra credentials to manage).
-2. `auth/kubernetes/role/demo-app` — binds the `demo-app` service account in
-   the `demo-app` namespace to the `demo-app` policy.
-3. `policies/demo-app-policy.hcl` — read-only on exactly one path
-   (`secret/data/demo-app`). Least privilege: this role can't read any other
-   app's secrets.
-4. `app-deployment.yaml` annotations tell the injector webhook to add an
-   `init` container (fetches the secret once, writes it, exits) and a
-   sidecar (keeps it renewed) to any pod matching the `demo-app` service
-   account — the Deployment spec itself has zero Vault-specific code.
-
-## Usage
+## Quick start
 
 ```bash
-helm repo add hashicorp https://helm.releases.hashicorp.com
-kubectl create namespace vault
-helm install vault hashicorp/vault -n vault -f manifests/vault-values.yaml
-
-kubectl -n vault exec vault-0 -- env VAULT_TOKEN=root vault kv put secret/demo-app \
-  db_password="..." api_key="..."
-kubectl -n vault exec vault-0 -- env VAULT_TOKEN=root vault auth enable kubernetes
-kubectl -n vault exec vault-0 -- sh -c 'VAULT_TOKEN=root vault write auth/kubernetes/config \
-  kubernetes_host="https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT"'
-kubectl -n vault exec vault-0 -- env VAULT_TOKEN=root vault policy write demo-app - < policies/demo-app-policy.hcl
-kubectl -n vault exec vault-0 -- env VAULT_TOKEN=root vault write auth/kubernetes/role/demo-app \
-  bound_service_account_names=demo-app bound_service_account_namespaces=demo-app \
-  policies=demo-app ttl=1h
-
-kubectl apply -f manifests/serviceaccount.yaml
-kubectl apply -f manifests/app-deployment.yaml
+make check-prereqs   # docker, kind, kubectl, helm
+make test            # cluster, Vault, injector, broken policy fails, fixed policy works
 ```
 
-Dev mode (`server.dev.enabled: true` in the values file) is unsealed
-automatically and stores everything in memory — right for this demo, wrong
-for anything you'd actually keep secrets in. Production would mean HA mode,
-a real storage backend (Raft/Consul), and auto-unseal via a cloud KMS.
-
-## Verified — actually deployed on a real cluster
-
-Spun up a local `kind` cluster, installed Vault dev mode + the injector via
-the official chart, and ran the full flow above for real:
+`make test` copies `.env.example` to `.env` if needed, creates a kind cluster with
+a private kubeconfig (`.kube/`), runs `scripts/e2e.sh`, and deletes the cluster.
+Expected lines:
 
 ```
-$ kubectl -n demo-app get pods
-demo-app-55855464cd-xmkjg   2/2     Running   0   5s     # 2/2 = app container + vault-agent sidecar
-
-$ kubectl -n demo-app exec demo-app-55855464cd-xmkjg -c demo-app -- cat /vault/secrets/db-creds
-DB_PASSWORD=s3cr3t-db-pass
-API_KEY=demo-api-key-12345
+OK: trap reproduced. Login worked, the read of secret/data/demo-app was denied, the app is not running.
+OK: the app read the secret from /vault/secrets and reported its SHA-256.
+OK: no secret value in the Deployment.
 ```
 
-The `demo-app` container itself is a stock `nginx-unprivileged` image with no
-Vault SDK, no token, no network call to Vault in its own code — the secret
-just showed up as a file because of the pod's service account + the
-annotations. That's the entire point of the injector pattern.
+`make up` runs the same script and keeps the cluster; running `scripts/e2e.sh` again on
+that cluster works (the Vault release is reused and the app pod is recreated before every
+inspection, so logs from an earlier run never count); `make down` removes it;
+`make reset` also deletes `.kube/` and `.env`.
 
-Stack: Kubernetes 1.31 (kind), Vault (official hashicorp/vault Helm chart,
-dev mode), Vault Agent Injector, tested on Ubuntu 22.04.
+| | Status |
+|---|---|
+| macOS arm64 + colima (4 CPU / 8 GB) | verified 2026-09-30: `make test` green from a copied directory (1 min 40 s), and `scripts/e2e.sh` re-run on a kept cluster. hashicorp/vault chart 0.34.1 (Vault 2.0.4, vault-k8s 1.7.6), kind 0.33.0, node image v1.37.0 pinned by digest, helm 4.3.0 |
+| ubuntu-24.04 GitHub runner | CI only, not measured here; see `.github/workflows/vault-agent-injection.yml` |
+| First-run time | about 67 s for `make test` with the kind node image and the Vault images already pulled once; a cold machine adds the image pulls (not measured) |
+| RAM | peak about 1.7 GB used in the colima VM (kind node, Vault dev pod, injector, app; other containers were running too, so an upper bound) |
+
+The module stays at `lab` until the
+script has been stable across several weekly runs.
+
+## Traps this avoids
+
+1. **Policy written for the KV v1-style path** (reproduced in tests). The policy
+   in `policies/demo-app-policy.hcl` uses `secret/data/demo-app`;
+   `traps/broken-policy.hcl` uses `secret/demo-app` and leaves the pod without secrets.
+2. **Secrets in the pod spec.** The Deployment has annotations and a template,
+   no values. The test checks that the secret does not appear in the Deployment.
+3. **Root token in the repo.** The dev root token comes from `.env` (git-ignored;
+   only `.env.example` is committed) and is passed to Helm on the command line.
+4. **Unpinned chart.** The `hashicorp/vault` chart version is pinned in
+   `.env.example`; images come from that chart version.
+5. **Apps that need a Vault SDK.** The test app only reads `/vault/secrets/db-creds`.
+
+## What the test proves / does NOT prove
+
+Proves, on a real cluster:
+
+- With the broken policy, a freshly created pod's `vault-agent-init` logs in successfully
+  (so the role and service account are fine) and is then denied on
+  `GET /v1/secret/data/demo-app`; the app container never becomes ready. A denied login
+  is not accepted as the trap. With the fixed policy and another fresh pod, the app starts
+  and the init container renders `/vault/secrets/db-creds`.
+- The app returns the SHA-256 of a random `db_password` written to Vault at test
+  time, computed independently by the script, and does not return the raw value.
+
+Does NOT prove:
+
+- Anything about production Vault. Dev mode is unsealed, in-memory, single-node,
+  with a root token. No HA, storage backend, auto-unseal, TLS, audit log or
+  token policies for operators.
+- Secret rotation. The sidecar renewal path is not exercised.
+- That the pinned chart and images stay current. 0.34.1 was the newest chart on
+  2026-09-29; see `VAULT_CHART_VERSION` in `.env.example` and check it against the Helm repo.
+- That Vault has no warnings: it prints one about the role having no audience configured.
+- Other auth methods, namespaces (Vault Enterprise), or the CSI provider and
+  External Secrets alternatives.
+
+## Local demo vs production
+
+- Run Vault outside the cluster or in HA mode with a real storage backend
+  (integrated Raft), TLS and auto-unseal through a cloud KMS or HSM.
+- Replace the root token with scoped operator policies and audit logging.
+- Bind roles to exact service account names and namespaces (the demo does) and
+  keep policies to one path each.
+- Decide how secret rotation reaches the app: the file changes, the app must
+  re-read it (this demo reads it on every request).
+- Consider `agent-init-first` and resource limits for the agent containers.
+
+## Copy it into your project
+
+Copy `manifests/`, `policies/`, and the parts of `scripts/e2e.sh` you want as a
+smoke test. The module has no references outside its directory. Change the role
+name, namespace and secret path together: the policy, the Vault role, the service
+account and the annotations must agree.
+
+## Layout
+
+```
+manifests/vault-values.yaml   Helm values for hashicorp/vault (dev mode + injector)
+manifests/serviceaccount.yaml namespace and service account
+manifests/app.yaml            demo app (reads /vault/secrets, returns hashes) with the annotations
+policies/demo-app-policy.hcl  read on secret/data/demo-app only
+traps/broken-policy.hcl       the trap: secret/demo-app (wrong for KV v2)
+scripts/e2e.sh                the end-to-end test
+```
